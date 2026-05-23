@@ -1,0 +1,11 @@
+<!DOCTYPE html>
+<html xmlns:th="http://www.thymeleaf.org">
+<head>
+    <title>Account Verification</title>
+</head>
+<body style="font-family: Arial, sans-serif; padding: 20px;">
+    <h2>Hello, <span th:text="${name}">User</span>!</h2>
+    <p>Thank you for registering at CodeSight. Please click the button below to verify your email address:</p>
+    <a th:href="${verificationUrl}" style="background-color: #4CAF50; color: white; padding: 10px 20px; text-decoration: none; border-radius: 5px; display: inline-block;">Verify Email</a>
+</body>
+</html>
