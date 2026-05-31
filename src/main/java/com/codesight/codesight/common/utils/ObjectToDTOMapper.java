@@ -33,6 +33,7 @@ public class ObjectToDTOMapper {
         return OrganizationResponseDto.builder()
                 .id(organization.getId())
                 .name(organization.getName())
+                .description(organization.getDescription())
                 .slug(organization.getSlug())
                 .createdByUserId(organization.getCreatedByUserId())
                 .createdAt(organization.getCreatedAt())

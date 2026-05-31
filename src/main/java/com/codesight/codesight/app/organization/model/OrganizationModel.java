@@ -21,6 +21,9 @@ public class OrganizationModel {
     @Column(nullable = false)
     private String name;
 
+    @Column(length = 500)
+    private String description;
+
     private String slug;
 
     @Column(nullable = false)

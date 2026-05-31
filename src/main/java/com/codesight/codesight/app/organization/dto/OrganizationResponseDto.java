@@ -15,6 +15,7 @@ import java.util.UUID;
 public class OrganizationResponseDto {
     private UUID id;
     private String name;
+    private String description;
     private String slug;
     private UUID createdByUserId;
     private LocalDateTime createdAt;

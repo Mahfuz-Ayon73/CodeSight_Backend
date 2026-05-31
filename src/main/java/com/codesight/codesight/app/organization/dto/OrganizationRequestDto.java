@@ -16,4 +16,7 @@ public class OrganizationRequestDto {
     @NotBlank
     @Size(max = 120)
     private String name;
+
+    @Size(max = 500)
+    private String description;
 }

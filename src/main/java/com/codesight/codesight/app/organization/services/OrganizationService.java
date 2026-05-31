@@ -32,6 +32,7 @@ public class OrganizationService {
 
         OrganizationModel organization = OrganizationModel.builder()
                 .name(request.getName().trim())
+                .description(request.getDescription())
                 .slug(slug)
                 .createdByUserId(userId)
                 .build();
