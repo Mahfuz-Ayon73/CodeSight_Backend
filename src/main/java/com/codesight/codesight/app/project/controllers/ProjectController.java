@@ -98,7 +98,7 @@ public class ProjectController {
             @PathVariable UUID projectId,
             @Valid @RequestBody GithubUploadRequestDto request,
             @AuthenticationPrincipal UserModel currentUser
-    ) throws Exception {
+    ) throws IOException {
         return ResponseEntity.ok(
                 projectUploadService.uploadFromGithub(
                         organizationId,

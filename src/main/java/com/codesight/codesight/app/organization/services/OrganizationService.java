@@ -7,7 +7,6 @@ import com.codesight.codesight.app.organization.model.OrganizationMemberRole;
 import com.codesight.codesight.app.organization.model.OrganizationModel;
 import com.codesight.codesight.app.organization.repository.OrganizationMemberRepository;
 import com.codesight.codesight.app.organization.repository.OrganizationRepository;
-import com.codesight.codesight.common.exception.BadRequestException;
 import com.codesight.codesight.common.exception.ResourceNotFoundException;
 import com.codesight.codesight.common.utils.ObjectToDTOMapper;
 import lombok.RequiredArgsConstructor;

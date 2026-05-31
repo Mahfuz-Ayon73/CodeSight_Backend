@@ -2,7 +2,6 @@ package com.codesight.codesight.app.project.services;
 
 import com.codesight.codesight.common.exception.BadRequestException;
 import org.eclipse.jgit.api.Git;
-import org.eclipse.jgit.api.errors.GitAPIException;
 import org.springframework.stereotype.Service;
 
 import java.nio.file.Path;
@@ -33,13 +32,17 @@ public class GithubCloneService {
         return trimmed;
     }
 
-    public void cloneRepository(String githubUrl, Path destination) throws GitAPIException {
+    public void cloneRepository(String githubUrl, Path destination) {
         String normalizedUrl = normalizeGithubUrl(githubUrl);
-        Git.cloneRepository()
-                .setURI(normalizedUrl)
-                .setDirectory(destination.toFile())
-                .setCloneAllBranches(false)
-                .call()
-                .close();
+        try {
+            Git.cloneRepository()
+                    .setURI(normalizedUrl)
+                    .setDirectory(destination.toFile())
+                    .setCloneAllBranches(false)
+                    .call()
+                    .close();
+        } catch (Exception ex) {
+            throw new RuntimeException("Failed to clone GitHub repository: " + ex.getMessage(), ex);
+        }
     }
 }

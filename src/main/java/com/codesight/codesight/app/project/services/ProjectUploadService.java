@@ -6,11 +6,9 @@ import com.codesight.codesight.app.project.model.AnalysisStatus;
 import com.codesight.codesight.app.project.model.ProjectModel;
 import com.codesight.codesight.app.project.model.ProjectSourceType;
 import com.codesight.codesight.app.project.repository.ProjectRepository;
-import com.codesight.codesight.common.exception.BadRequestException;
 import com.codesight.codesight.common.exception.ResourceNotFoundException;
 import com.codesight.codesight.common.utils.ObjectToDTOMapper;
 import lombok.RequiredArgsConstructor;
-import org.eclipse.jgit.api.errors.GitAPIException;
 import org.springframework.stereotype.Service;
 import org.springframework.transaction.annotation.Transactional;
 import org.springframework.web.multipart.MultipartFile;
@@ -92,7 +90,7 @@ public class ProjectUploadService {
             UUID projectId,
             UUID userId,
             String githubUrl
-    ) throws GitAPIException, IOException {
+    ) throws IOException {
         ProjectModel project = loadProjectForUpload(organizationId, projectId, userId);
         String normalizedUrl = githubCloneService.normalizeGithubUrl(githubUrl);
         Path repoPath = codebaseStorageService.resolveProjectRepoPath(organizationId, projectId);
@@ -101,18 +99,11 @@ public class ProjectUploadService {
             codebaseStorageService.prepareRepoDirectory(repoPath);
             githubCloneService.cloneRepository(normalizedUrl, repoPath);
             markUploadSuccess(project, ProjectSourceType.GITHUB, normalizedUrl, repoPath);
-        } catch (GitAPIException ex) {
+        } catch (Exception ex) {
             markUploadFailure(project, ex.getMessage());
             projectRepository.save(project);
-            throw ex;
-        } catch (IOException ex) {
-            markUploadFailure(project, ex.getMessage());
-            projectRepository.save(project);
-            throw ex;
-        } catch (RuntimeException ex) {
-            markUploadFailure(project, ex.getMessage());
-            projectRepository.save(project);
-            throw ex;
+            if (ex instanceof IOException ioEx) throw ioEx;
+            throw new RuntimeException(ex.getMessage(), ex);
         }
 
         return ObjectToDTOMapper.toProjectResponseDto(projectRepository.save(project));

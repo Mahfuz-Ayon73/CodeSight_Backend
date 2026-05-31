@@ -4,7 +4,10 @@ import com.codesight.codesight.app.organization.services.OrganizationAccessServi
 import com.codesight.codesight.app.project.dto.ProjectRequestDto;
 import com.codesight.codesight.app.project.dto.ProjectResponseDto;
 import com.codesight.codesight.app.project.model.AnalysisStatus;
+import com.codesight.codesight.app.project.model.ProjectMemberModel;
+import com.codesight.codesight.app.project.model.ProjectMemberRole;
 import com.codesight.codesight.app.project.model.ProjectModel;
+import com.codesight.codesight.app.project.repository.ProjectMemberRepository;
 import com.codesight.codesight.app.project.repository.ProjectRepository;
 import com.codesight.codesight.common.exception.ResourceNotFoundException;
 import com.codesight.codesight.common.exception.UnauthorizedException;
@@ -22,6 +25,7 @@ import java.util.stream.Collectors;
 public class ProjectService {
 
     private final ProjectRepository projectRepository;
+    private final ProjectMemberRepository projectMemberRepository;
     private final OrganizationAccessService organizationAccessService;
 
     @Transactional
@@ -36,7 +40,17 @@ public class ProjectService {
                 .analysisStatus(AnalysisStatus.PENDING_UPLOAD)
                 .build();
 
-        return ObjectToDTOMapper.toProjectResponseDto(projectRepository.save(project));
+        ProjectModel saved = projectRepository.save(project);
+
+        // Auto-enroll the creator as OWNER in project_members
+        projectMemberRepository.save(ProjectMemberModel.builder()
+                .projectId(saved.getId())
+                .userId(ownerId)
+                .organizationId(organizationId)
+                .role(ProjectMemberRole.OWNER)
+                .build());
+
+        return ObjectToDTOMapper.toProjectResponseDto(saved);
     }
 
     public ProjectResponseDto getProject(UUID organizationId, UUID projectId, UUID userId) {
