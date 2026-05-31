@@ -52,6 +52,18 @@ public class JWTService {
                 .compact();
     }
 
+    public String generatePasswordResetToken(String email, long expirationMs) {
+        Map<String, Object> claims = new HashMap<>();
+        claims.put("purpose", "password-reset");
+        return Jwts.builder()
+                .claims(claims)
+                .subject(email)
+                .issuedAt(new Date(System.currentTimeMillis()))
+                .expiration(new Date(System.currentTimeMillis() + expirationMs))
+                .signWith(getSignInKey())
+                .compact();
+    }
+
     private String buildToken(
             Map<String, Object> extraClaims,
             UserDetails userDetails,

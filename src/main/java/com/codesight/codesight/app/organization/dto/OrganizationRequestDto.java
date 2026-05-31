@@ -1,4 +1,4 @@
-package com.codesight.codesight.app.project.dto;
+package com.codesight.codesight.app.organization.dto;
 
 import jakarta.validation.constraints.NotBlank;
 import jakarta.validation.constraints.Size;
@@ -11,12 +11,9 @@ import lombok.NoArgsConstructor;
 @Builder
 @NoArgsConstructor
 @AllArgsConstructor
-public class ProjectRequestDto {
+public class OrganizationRequestDto {
 
     @NotBlank
     @Size(max = 120)
     private String name;
-
-    @Size(max = 500)
-    private String description;
 }

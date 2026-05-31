@@ -1,10 +1,10 @@
-package com.codesight.codesight.app.user.dto;
+package com.codesight.codesight.app.organization.dto;
 
-import com.codesight.codesight.app.user.role.UserRole;
 import lombok.AllArgsConstructor;
 import lombok.Builder;
 import lombok.Data;
 import lombok.NoArgsConstructor;
+
 import java.time.LocalDateTime;
 import java.util.UUID;
 
@@ -12,14 +12,11 @@ import java.util.UUID;
 @Builder
 @NoArgsConstructor
 @AllArgsConstructor
-public class UserResponseDto {
+public class OrganizationResponseDto {
     private UUID id;
-    private String email;
-    private String username;
-    private String firstName;
-    private String lastName;
-    private UserRole role;
-    private boolean isEnabled;
+    private String name;
+    private String slug;
+    private UUID createdByUserId;
     private LocalDateTime createdAt;
     private LocalDateTime updatedAt;
 }

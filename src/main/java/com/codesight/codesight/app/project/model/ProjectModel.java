@@ -2,6 +2,7 @@ package com.codesight.codesight.app.project.model;
 
 import jakarta.persistence.*;
 import lombok.*;
+
 import java.time.LocalDateTime;
 import java.util.UUID;
 
@@ -22,8 +23,29 @@ public class ProjectModel {
     private String description;
 
     @Column(nullable = false)
+    private UUID organizationId;
+
+    @Column(nullable = false)
     private UUID ownerId;
 
+    @Enumerated(EnumType.STRING)
+    @Column(nullable = false)
+    @Builder.Default
+    private ProjectSourceType sourceType = ProjectSourceType.LOCAL_ZIP;
+
+    private String githubUrl;
+
+    /** Absolute path to extracted/cloned repository on disk */
+    private String storagePath;
+
+    @Enumerated(EnumType.STRING)
+    @Column(nullable = false)
+    @Builder.Default
+    private AnalysisStatus analysisStatus = AnalysisStatus.PENDING_UPLOAD;
+
+    private String uploadErrorMessage;
+
+    private LocalDateTime uploadedAt;
     private LocalDateTime createdAt;
     private LocalDateTime updatedAt;
 

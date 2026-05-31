@@ -1,7 +1,6 @@
 package com.codesight.codesight.app.project.dto;
 
 import jakarta.validation.constraints.NotBlank;
-import jakarta.validation.constraints.Size;
 import lombok.AllArgsConstructor;
 import lombok.Builder;
 import lombok.Data;
@@ -11,12 +10,8 @@ import lombok.NoArgsConstructor;
 @Builder
 @NoArgsConstructor
 @AllArgsConstructor
-public class ProjectRequestDto {
+public class GithubUploadRequestDto {
 
     @NotBlank
-    @Size(max = 120)
-    private String name;
-
-    @Size(max = 500)
-    private String description;
+    private String githubUrl;
 }

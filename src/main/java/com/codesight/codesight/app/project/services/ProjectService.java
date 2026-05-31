@@ -1,7 +1,9 @@
 package com.codesight.codesight.app.project.services;
 
+import com.codesight.codesight.app.organization.services.OrganizationAccessService;
 import com.codesight.codesight.app.project.dto.ProjectRequestDto;
 import com.codesight.codesight.app.project.dto.ProjectResponseDto;
+import com.codesight.codesight.app.project.model.AnalysisStatus;
 import com.codesight.codesight.app.project.model.ProjectModel;
 import com.codesight.codesight.app.project.repository.ProjectRepository;
 import com.codesight.codesight.common.exception.ResourceNotFoundException;
@@ -9,6 +11,7 @@ import com.codesight.codesight.common.exception.UnauthorizedException;
 import com.codesight.codesight.common.utils.ObjectToDTOMapper;
 import lombok.RequiredArgsConstructor;
 import org.springframework.stereotype.Service;
+import org.springframework.transaction.annotation.Transactional;
 
 import java.util.List;
 import java.util.UUID;
@@ -19,36 +22,45 @@ import java.util.stream.Collectors;
 public class ProjectService {
 
     private final ProjectRepository projectRepository;
+    private final OrganizationAccessService organizationAccessService;
 
-    public ProjectResponseDto createProject(ProjectRequestDto requestDto, UUID ownerId) {
+    @Transactional
+    public ProjectResponseDto createProject(UUID organizationId, ProjectRequestDto request, UUID ownerId) {
+        organizationAccessService.requireMembership(organizationId, ownerId);
+
         ProjectModel project = ProjectModel.builder()
-                .name(requestDto.getName())
-                .description(requestDto.getDescription())
+                .name(request.getName().trim())
+                .description(request.getDescription())
+                .organizationId(organizationId)
                 .ownerId(ownerId)
+                .analysisStatus(AnalysisStatus.PENDING_UPLOAD)
                 .build();
 
-        ProjectModel savedProject = projectRepository.save(project);
-        return ObjectToDTOMapper.toProjectResponseDto(savedProject);
+        return ObjectToDTOMapper.toProjectResponseDto(projectRepository.save(project));
     }
 
-    public ProjectResponseDto getProjectById(UUID id) {
-        ProjectModel project = projectRepository.findById(id)
-                .orElseThrow(() -> new ResourceNotFoundException("Project not found with ID: " + id));
+    public ProjectResponseDto getProject(UUID organizationId, UUID projectId, UUID userId) {
+        organizationAccessService.requireMembership(organizationId, userId);
+        ProjectModel project = projectRepository.findByIdAndOrganizationId(projectId, organizationId)
+                .orElseThrow(() -> new ResourceNotFoundException("Project not found"));
         return ObjectToDTOMapper.toProjectResponseDto(project);
     }
 
-    public List<ProjectResponseDto> getAllProjectsByOwner(UUID ownerId) {
-        return projectRepository.findAllByOwnerId(ownerId).stream()
+    public List<ProjectResponseDto> listProjects(UUID organizationId, UUID userId) {
+        organizationAccessService.requireMembership(organizationId, userId);
+        return projectRepository.findAllByOrganizationId(organizationId).stream()
                 .map(ObjectToDTOMapper::toProjectResponseDto)
                 .collect(Collectors.toList());
     }
 
-    public void deleteProject(UUID id, UUID ownerId) {
-        ProjectModel project = projectRepository.findById(id)
-                .orElseThrow(() -> new ResourceNotFoundException("Project not found with ID: " + id));
+    @Transactional
+    public void deleteProject(UUID organizationId, UUID projectId, UUID userId) {
+        organizationAccessService.requireMembership(organizationId, userId);
+        ProjectModel project = projectRepository.findByIdAndOrganizationId(projectId, organizationId)
+                .orElseThrow(() -> new ResourceNotFoundException("Project not found"));
 
-        if (!project.getOwnerId().equals(ownerId)) {
-            throw new UnauthorizedException("You are not authorized to delete this project");
+        if (!project.getOwnerId().equals(userId)) {
+            throw new UnauthorizedException("Only the project owner can delete this project");
         }
 
         projectRepository.delete(project);

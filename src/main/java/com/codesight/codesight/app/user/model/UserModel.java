@@ -31,7 +31,13 @@ public class UserModel implements UserDetails {
     private String password;
 
     @Column(nullable = false)
-    private String username;
+    private String firstName;
+
+    @Column(nullable = false)
+    private String lastName;
+
+    @Column(name = "username", nullable = false, unique = true)
+    private String handle;
 
     @Enumerated(EnumType.STRING)
     @Column(nullable = false)
