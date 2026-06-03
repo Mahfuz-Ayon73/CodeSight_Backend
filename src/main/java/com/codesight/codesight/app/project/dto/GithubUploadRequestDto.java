@@ -14,4 +14,7 @@ public class GithubUploadRequestDto {
 
     @NotBlank
     private String githubUrl;
+
+    /** Optional — required only for private repositories. */
+    private String accessToken;
 }

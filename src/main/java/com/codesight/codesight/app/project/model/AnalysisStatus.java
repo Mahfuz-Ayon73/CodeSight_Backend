@@ -6,5 +6,6 @@ public enum AnalysisStatus {
     READY_FOR_ANALYSIS,
     ANALYZING,
     COMPLETED,
-    FAILED
+    FAILED,
+    IN_PROGRESS
 }

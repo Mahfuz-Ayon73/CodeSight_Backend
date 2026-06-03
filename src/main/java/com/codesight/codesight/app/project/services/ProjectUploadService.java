@@ -29,6 +29,7 @@ public class ProjectUploadService {
     private final ZipExtractService zipExtractService;
     private final FolderUploadService folderUploadService;
     private final GithubCloneService githubCloneService;
+    private final PythonAnalysisService pythonAnalysisService;
 
     @Transactional
     public ProjectResponseDto uploadZip(
@@ -91,13 +92,24 @@ public class ProjectUploadService {
             UUID userId,
             String githubUrl
     ) throws IOException {
+        return uploadFromGithub(organizationId, projectId, userId, githubUrl, null);
+    }
+
+    @Transactional
+    public ProjectResponseDto uploadFromGithub(
+            UUID organizationId,
+            UUID projectId,
+            UUID userId,
+            String githubUrl,
+            String accessToken
+    ) throws IOException {
         ProjectModel project = loadProjectForUpload(organizationId, projectId, userId);
         String normalizedUrl = githubCloneService.normalizeGithubUrl(githubUrl);
         Path repoPath = codebaseStorageService.resolveProjectRepoPath(organizationId, projectId);
 
         try {
             codebaseStorageService.prepareRepoDirectory(repoPath);
-            githubCloneService.cloneRepository(normalizedUrl, repoPath);
+            githubCloneService.cloneRepository(normalizedUrl, repoPath, accessToken);
             markUploadSuccess(project, ProjectSourceType.GITHUB, normalizedUrl, repoPath);
         } catch (Exception ex) {
             markUploadFailure(project, ex.getMessage());
@@ -127,6 +139,14 @@ public class ProjectUploadService {
         project.setAnalysisStatus(AnalysisStatus.READY_FOR_ANALYSIS);
         project.setUploadErrorMessage(null);
         project.setUploadedAt(LocalDateTime.now());
+        
+        // Trigger Python analysis asynchronously after successful upload
+        ProjectModel savedProject = projectRepository.save(project);
+        pythonAnalysisService.triggerAnalysisAsync(
+            savedProject.getOrganizationId(),
+            savedProject.getId(),
+            repoPath
+        );
     }
 
     private void markUploadFailure(ProjectModel project, String message) {

@@ -23,11 +23,13 @@ public class FolderUploadService {
 
         int saved = 0;
         for (MultipartFile file : files) {
-            if (file == null || file.isEmpty()) {
-                continue;
-            }
+            if (file == null || file.isEmpty()) continue;
 
             String relativePath = resolveRelativePath(file);
+
+            // Skip files inside blacklisted directories
+            if (ZipExtractService.isBlacklisted(relativePath)) continue;
+
             Path target = root.resolve(relativePath).normalize();
 
             if (!target.startsWith(root)) {

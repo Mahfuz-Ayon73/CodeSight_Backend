@@ -46,6 +46,7 @@ public class ProjectModel {
     private String uploadErrorMessage;
 
     private LocalDateTime uploadedAt;
+    private LocalDateTime analysisCompletedAt;
     private LocalDateTime createdAt;
     private LocalDateTime updatedAt;
 

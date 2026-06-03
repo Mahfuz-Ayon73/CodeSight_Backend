@@ -1,8 +1,10 @@
 package com.codesight.codesight.app.project.controllers;
 
+import com.codesight.codesight.app.project.dto.BlueprintDto;
 import com.codesight.codesight.app.project.dto.GithubUploadRequestDto;
 import com.codesight.codesight.app.project.dto.ProjectRequestDto;
 import com.codesight.codesight.app.project.dto.ProjectResponseDto;
+import com.codesight.codesight.app.project.services.ProjectAnalysisBlueprintService;
 import com.codesight.codesight.app.project.services.ProjectService;
 import com.codesight.codesight.app.project.services.ProjectUploadService;
 import com.codesight.codesight.app.user.model.UserModel;
@@ -26,6 +28,7 @@ public class ProjectController {
 
     private final ProjectService projectService;
     private final ProjectUploadService projectUploadService;
+    private final ProjectAnalysisBlueprintService blueprintService;
 
     @PostMapping
     public ResponseEntity<ProjectResponseDto> createProject(
@@ -104,8 +107,20 @@ public class ProjectController {
                         organizationId,
                         projectId,
                         currentUser.getId(),
-                        request.getGithubUrl()
+                        request.getGithubUrl(),
+                        request.getAccessToken()
                 )
+        );
+    }
+
+    @GetMapping("/{projectId}/blueprint")
+    public ResponseEntity<BlueprintDto> getBlueprint(
+            @PathVariable UUID organizationId,
+            @PathVariable UUID projectId,
+            @AuthenticationPrincipal UserModel currentUser
+    ) {
+        return ResponseEntity.ok(
+                blueprintService.getBlueprint(organizationId, projectId, currentUser.getId())
         );
     }
 }
