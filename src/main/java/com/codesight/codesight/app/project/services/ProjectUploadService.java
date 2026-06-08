@@ -9,6 +9,7 @@ import com.codesight.codesight.app.project.repository.ProjectRepository;
 import com.codesight.codesight.common.exception.ResourceNotFoundException;
 import com.codesight.codesight.common.utils.ObjectToDTOMapper;
 import lombok.RequiredArgsConstructor;
+import lombok.extern.slf4j.Slf4j;
 import org.springframework.stereotype.Service;
 import org.springframework.transaction.annotation.Transactional;
 import org.springframework.web.multipart.MultipartFile;
@@ -19,6 +20,7 @@ import java.time.LocalDateTime;
 import java.util.List;
 import java.util.UUID;
 
+@Slf4j
 @Service
 @RequiredArgsConstructor
 public class ProjectUploadService {
@@ -38,23 +40,38 @@ public class ProjectUploadService {
             UUID userId,
             MultipartFile file
     ) throws IOException {
+        log.info("[ZIP] Upload started — org={} project={} user={} fileSize={}bytes filename={}",
+                organizationId, projectId, userId,
+                file != null ? file.getSize() : -1,
+                file != null ? file.getOriginalFilename() : "null");
+
         ProjectModel project = loadProjectForUpload(organizationId, projectId, userId);
+        log.info("[ZIP] Project loaded — status={}", project.getAnalysisStatus());
+
         Path repoPath = codebaseStorageService.resolveProjectRepoPath(organizationId, projectId);
+        log.info("[ZIP] Repo path resolved — {}", repoPath);
 
         try {
             codebaseStorageService.prepareRepoDirectory(repoPath);
+            log.info("[ZIP] Directory prepared — extracting ZIP...");
+
             zipExtractService.extractZip(file, repoPath);
+            log.info("[ZIP] Extraction complete — marking success");
+
             markUploadSuccess(project, ProjectSourceType.LOCAL_ZIP, null, repoPath);
         } catch (IOException ex) {
+            log.error("[ZIP] IOException during upload: {}", ex.getMessage(), ex);
             markUploadFailure(project, ex.getMessage());
             projectRepository.save(project);
             throw ex;
         } catch (RuntimeException ex) {
+            log.error("[ZIP] RuntimeException during upload: {}", ex.getMessage(), ex);
             markUploadFailure(project, ex.getMessage());
             projectRepository.save(project);
             throw ex;
         }
 
+        log.info("[ZIP] Upload finished successfully");
         return ObjectToDTOMapper.toProjectResponseDto(projectRepository.save(project));
     }
 

@@ -36,6 +36,7 @@ public class ProjectModel {
     private String githubUrl;
 
     /** Absolute path to extracted/cloned repository on disk */
+    @Column(length = 1024)
     private String storagePath;
 
     @Enumerated(EnumType.STRING)
@@ -43,6 +44,7 @@ public class ProjectModel {
     @Builder.Default
     private AnalysisStatus analysisStatus = AnalysisStatus.PENDING_UPLOAD;
 
+    @Column(length = 2048)
     private String uploadErrorMessage;
 
     private LocalDateTime uploadedAt;

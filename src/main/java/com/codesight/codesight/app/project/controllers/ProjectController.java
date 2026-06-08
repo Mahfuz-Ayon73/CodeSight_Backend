@@ -4,12 +4,14 @@ import com.codesight.codesight.app.project.dto.BlueprintDto;
 import com.codesight.codesight.app.project.dto.GithubUploadRequestDto;
 import com.codesight.codesight.app.project.dto.ProjectRequestDto;
 import com.codesight.codesight.app.project.dto.ProjectResponseDto;
+import com.codesight.codesight.app.project.services.ChunkedUploadService;
 import com.codesight.codesight.app.project.services.ProjectAnalysisBlueprintService;
 import com.codesight.codesight.app.project.services.ProjectService;
 import com.codesight.codesight.app.project.services.ProjectUploadService;
 import com.codesight.codesight.app.user.model.UserModel;
 import jakarta.validation.Valid;
 import lombok.RequiredArgsConstructor;
+import lombok.extern.slf4j.Slf4j;
 import org.springframework.http.HttpStatus;
 import org.springframework.http.MediaType;
 import org.springframework.http.ResponseEntity;
@@ -24,11 +26,13 @@ import java.util.UUID;
 @RestController
 @RequestMapping("/api/v1/organizations/{organizationId}/projects")
 @RequiredArgsConstructor
+@Slf4j
 public class ProjectController {
 
     private final ProjectService projectService;
     private final ProjectUploadService projectUploadService;
     private final ProjectAnalysisBlueprintService blueprintService;
+    private final ChunkedUploadService chunkedUploadService;
 
     @PostMapping
     public ResponseEntity<ProjectResponseDto> createProject(
@@ -74,6 +78,8 @@ public class ProjectController {
             @RequestPart("file") MultipartFile file,
             @AuthenticationPrincipal UserModel currentUser
     ) throws IOException {
+        log.info("[CONTROLLER] ZIP upload request received — org={} project={} user={} contentSize={}",
+                organizationId, projectId, currentUser.getId(), file != null ? file.getSize() : -1);
         return ResponseEntity.ok(
                 projectUploadService.uploadZip(organizationId, projectId, currentUser.getId(), file)
         );
@@ -122,5 +128,43 @@ public class ProjectController {
         return ResponseEntity.ok(
                 blueprintService.getBlueprint(organizationId, projectId, currentUser.getId())
         );
+    }
+
+    @PostMapping(value = "/{projectId}/upload/zip-chunk", consumes = MediaType.MULTIPART_FORM_DATA_VALUE)
+    public ResponseEntity<ProjectResponseDto> uploadZipChunk(
+            @PathVariable UUID organizationId,
+            @PathVariable UUID projectId,
+            @RequestParam("chunk") MultipartFile chunk,
+            @RequestParam("uploadId") String uploadId,
+            @RequestParam("chunkIndex") int chunkIndex,
+            @RequestParam("totalChunks") int totalChunks,
+            @RequestParam("fileName") String fileName,
+            @AuthenticationPrincipal UserModel currentUser
+    ) throws IOException {
+        log.info("[CHUNK-CONTROLLER] chunk={}/{} uploadId={} project={}", chunkIndex + 1, totalChunks, uploadId, projectId);
+
+        java.nio.file.Path assembledFile = chunkedUploadService.saveChunk(
+                uploadId, chunkIndex, totalChunks, fileName, chunk
+        );
+
+        if (assembledFile != null) {
+            try {
+                com.codesight.codesight.common.utils.FileMultipartFile zipFile =
+                    new com.codesight.codesight.common.utils.FileMultipartFile(
+                        assembledFile, fileName, "application/zip"
+                    );
+                ProjectResponseDto result = projectUploadService.uploadZip(
+                        organizationId, projectId, currentUser.getId(), zipFile
+                );
+                chunkedUploadService.cleanupTempDir(uploadId);
+                return ResponseEntity.ok(result);
+            } catch (Exception e) {
+                chunkedUploadService.cleanupTempDir(uploadId);
+                throw e;
+            }
+        }
+
+        // Still receiving chunks — return 202 Accepted
+        return ResponseEntity.accepted().build();
     }
 }
