@@ -170,4 +170,36 @@ public class ProjectUploadService {
         project.setAnalysisStatus(AnalysisStatus.FAILED);
         project.setUploadErrorMessage(message);
     }
+
+    @Transactional
+    public ProjectResponseDto resetCodebase(UUID organizationId, UUID projectId, UUID userId) {
+        organizationAccessService.requireMembership(organizationId, userId);
+        ProjectModel project = projectRepository.findByIdAndOrganizationId(projectId, organizationId)
+                .orElseThrow(() -> new com.codesight.codesight.common.exception.ResourceNotFoundException("Project not found"));
+
+        // Delete stored files if they exist
+        if (project.getStoragePath() != null) {
+            try {
+                java.nio.file.Path repoPath = java.nio.file.Paths.get(project.getStoragePath());
+                if (java.nio.file.Files.exists(repoPath)) {
+                    java.nio.file.Files.walk(repoPath)
+                        .sorted(java.util.Comparator.reverseOrder())
+                        .map(java.nio.file.Path::toFile)
+                        .forEach(java.io.File::delete);
+                }
+            } catch (Exception e) {
+                log.warn("Failed to delete codebase files for project {}: {}", projectId, e.getMessage());
+            }
+        }
+
+        project.setAnalysisStatus(AnalysisStatus.PENDING_UPLOAD);
+        project.setStoragePath(null);
+        project.setSourceType(ProjectSourceType.LOCAL_ZIP);
+        project.setGithubUrl(null);
+        project.setUploadedAt(null);
+        project.setUploadErrorMessage(null);
+        project.setAnalysisCompletedAt(null);
+
+        return ObjectToDTOMapper.toProjectResponseDto(projectRepository.save(project));
+    }
 }

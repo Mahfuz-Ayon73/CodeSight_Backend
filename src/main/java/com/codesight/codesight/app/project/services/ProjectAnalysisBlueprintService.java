@@ -47,7 +47,10 @@ public class ProjectAnalysisBlueprintService {
                 .resolve(projectId.toString())
                 .resolve("graph_blueprint.json");
 
+        log.info("[BLUEPRINT] Looking for blueprint at: {}", blueprintPath.toAbsolutePath());
+
         if (!Files.exists(blueprintPath)) {
+            log.warn("[BLUEPRINT] File not found at: {}", blueprintPath.toAbsolutePath());
             throw new ResourceNotFoundException("Blueprint file not found for this project");
         }
 

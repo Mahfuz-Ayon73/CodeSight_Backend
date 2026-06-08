@@ -119,6 +119,17 @@ public class ProjectController {
         );
     }
 
+    @DeleteMapping("/{projectId}/codebase")
+    public ResponseEntity<ProjectResponseDto> resetCodebase(
+            @PathVariable UUID organizationId,
+            @PathVariable UUID projectId,
+            @AuthenticationPrincipal UserModel currentUser
+    ) {
+        return ResponseEntity.ok(
+                projectUploadService.resetCodebase(organizationId, projectId, currentUser.getId())
+        );
+    }
+
     @GetMapping("/{projectId}/blueprint")
     public ResponseEntity<BlueprintDto> getBlueprint(
             @PathVariable UUID organizationId,
