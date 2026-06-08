@@ -34,3 +34,10 @@ build/
 
 ### VS Code ###
 .vscode/
+
+# Postman
+postman/
+.postman/
+*.postman_collection.json
+*.postman_environment.json
+.env.example
