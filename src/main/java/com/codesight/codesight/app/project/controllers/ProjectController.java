@@ -8,6 +8,7 @@ import com.codesight.codesight.app.project.services.ChunkedUploadService;
 import com.codesight.codesight.app.project.services.ProjectAnalysisBlueprintService;
 import com.codesight.codesight.app.project.services.ProjectService;
 import com.codesight.codesight.app.project.services.ProjectUploadService;
+import com.codesight.codesight.app.project.services.PythonAnalysisService;
 import com.codesight.codesight.app.user.model.UserModel;
 import jakarta.validation.Valid;
 import lombok.RequiredArgsConstructor;
@@ -33,6 +34,7 @@ public class ProjectController {
     private final ProjectUploadService projectUploadService;
     private final ProjectAnalysisBlueprintService blueprintService;
     private final ChunkedUploadService chunkedUploadService;
+    private final PythonAnalysisService pythonAnalysisService;
 
     @PostMapping
     public ResponseEntity<ProjectResponseDto> createProject(
@@ -128,6 +130,21 @@ public class ProjectController {
         return ResponseEntity.ok(
                 projectUploadService.resetCodebase(organizationId, projectId, currentUser.getId())
         );
+    }
+
+    @PostMapping("/{projectId}/analyze")
+    public ResponseEntity<Void> triggerAnalysis(
+            @PathVariable UUID organizationId,
+            @PathVariable UUID projectId,
+            @AuthenticationPrincipal UserModel currentUser
+    ) {
+        log.info("[CONTROLLER] Manual analysis trigger — org={} project={}", organizationId, projectId);
+        var project = projectService.getProject(organizationId, projectId, currentUser.getId());
+        java.nio.file.Path repoPath = java.nio.file.Paths.get(
+            projectUploadService.getStoragePath(organizationId, projectId, currentUser.getId())
+        );
+        pythonAnalysisService.triggerAnalysisAsync(organizationId, projectId, repoPath);
+        return ResponseEntity.accepted().build();
     }
 
     @GetMapping("/{projectId}/blueprint")

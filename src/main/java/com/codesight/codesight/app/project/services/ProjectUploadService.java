@@ -138,6 +138,13 @@ public class ProjectUploadService {
         return ObjectToDTOMapper.toProjectResponseDto(projectRepository.save(project));
     }
 
+    public String getStoragePath(UUID organizationId, UUID projectId, UUID userId) {
+        organizationAccessService.requireMembership(organizationId, userId);
+        return projectRepository.findByIdAndOrganizationId(projectId, organizationId)
+                .orElseThrow(() -> new com.codesight.codesight.common.exception.ResourceNotFoundException("Project not found"))
+                .getStoragePath();
+    }
+
     private ProjectModel loadProjectForUpload(UUID organizationId, UUID projectId, UUID userId) {
         organizationAccessService.requireMembership(organizationId, userId);
         return projectRepository.findByIdAndOrganizationId(projectId, organizationId)
@@ -156,14 +163,7 @@ public class ProjectUploadService {
         project.setAnalysisStatus(AnalysisStatus.READY_FOR_ANALYSIS);
         project.setUploadErrorMessage(null);
         project.setUploadedAt(LocalDateTime.now());
-        
-        // Trigger Python analysis asynchronously after successful upload
-        ProjectModel savedProject = projectRepository.save(project);
-        pythonAnalysisService.triggerAnalysisAsync(
-            savedProject.getOrganizationId(),
-            savedProject.getId(),
-            repoPath
-        );
+        // Analysis is now triggered manually by the user
     }
 
     private void markUploadFailure(ProjectModel project, String message) {
