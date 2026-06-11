@@ -20,10 +20,13 @@ import numpy as np
 
 try:
     from tree_sitter import Language, Parser
-    import tree_sitter_javascript as tsjs
     import tree_sitter_typescript as tsts
 
-    JS_LANGUAGE  = Language(tsjs.language())
+    # tree-sitter-javascript's language() is a CommonJS/script grammar — it does
+    # NOT recognise import_declaration nodes, causing query failures on ESM files.
+    # The TypeScript grammar is a strict superset of ESM JavaScript and handles
+    # import/export correctly for both .ts and .js/.jsx files.
+    JS_LANGUAGE  = Language(tsts.language_typescript())
     TS_LANGUAGE  = Language(tsts.language_typescript())
     TSX_LANGUAGE = Language(tsts.language_tsx())
 
@@ -131,22 +134,36 @@ def _extract_imports_treesitter(source_code: str, canonical: str) -> list[str]:
     imports: list[str] = []
 
     # Query for import declarations and dynamic imports
+    # Note: tree-sitter-typescript uses `import_statement` (not `import_declaration`)
+    # and `export_statement` for re-exports.
     query_text = """
-        (import_declaration
+        (import_statement
             source: (string (string_fragment) @import_path))
         (call_expression
             function: (import)
             arguments: (arguments (string (string_fragment) @import_path)))
         (export_statement
             source: (string (string_fragment) @import_path))
+        (call_expression
+            function: (identifier) @fn (#eq? @fn "require")
+            arguments: (arguments (string (string_fragment) @import_path)))
     """
     try:
         query = lang.query(query_text)
         captures = query.captures(tree.root_node)
-        for node, _ in captures:
-            imports.append(node.text.decode("utf-8"))
-    except Exception:
-        pass
+
+        # tree-sitter >= 0.22 returns dict[str, list[Node]];
+        # older versions return list[tuple[Node, str]].
+        if isinstance(captures, dict):
+            for nodes in captures.values():
+                for node in nodes:
+                    imports.append(node.text.decode("utf-8"))
+        else:
+            for node, _ in captures:
+                imports.append(node.text.decode("utf-8"))
+    except Exception as e:
+        print(f"[Parser] Tree-sitter query failed for {canonical}: {e} — falling back to regex.")
+        return _extract_imports_regex(source_code)
 
     return imports
 

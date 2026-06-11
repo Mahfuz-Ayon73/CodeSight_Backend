@@ -76,17 +76,16 @@ def run_leiden(G: nx.DiGraph) -> dict[int, int]:
     """
     Run the Leiden algorithm on the graph.
     Returns a mapping of node_id -> community_id.
-    Falls back to connected components if leidenalg is not available.
+    Falls back to Louvain (via NetworkX) if leidenalg is not available.
     """
     try:
         import igraph as ig
         import leidenalg
 
-        # Convert NetworkX DiGraph to igraph
         node_ids = list(G.nodes())
         if not node_ids:
             return {}
-            
+
         id_to_idx = {nid: i for i, nid in enumerate(node_ids)}
 
         edges_ig = []
@@ -97,8 +96,7 @@ def run_leiden(G: nx.DiGraph) -> dict[int, int]:
                 weights_ig.append(float(data.get("weight", 1.0)))
 
         if not edges_ig:
-            # No edges — each node is its own community
-            return {nid: i for i, nid in enumerate(node_ids)}
+            return _fallback_louvain(G)
 
         ig_graph = ig.Graph(n=len(node_ids), edges=edges_ig, directed=True)
         ig_graph.es["weight"] = weights_ig
@@ -119,15 +117,48 @@ def run_leiden(G: nx.DiGraph) -> dict[int, int]:
         return community_map
 
     except ImportError as e:
-        print(f"[WARN] leidenalg/igraph not available ({e}), falling back to connected components.")
-        return _fallback_communities(G)
+        print(f"[INFO] leidenalg/igraph not available ({e}), using Louvain via NetworkX.")
+        return _fallback_louvain(G)
     except Exception as e:
-        print(f"[WARN] Leiden failed ({e}), falling back to connected components.")
-        return _fallback_communities(G)
+        print(f"[WARN] Leiden failed ({e}), using Louvain via NetworkX.")
+        return _fallback_louvain(G)
 
 
-def _fallback_communities(G: nx.DiGraph) -> dict[int, int]:
-    """Simple fallback: weakly connected components as communities."""
+def _fallback_louvain(G: nx.DiGraph) -> dict[int, int]:
+    """
+    Use NetworkX's Louvain community detection on the undirected projection.
+    This properly merges connected nodes into communities rather than giving
+    each isolated node its own cluster.
+    Falls back to weakly connected components if Louvain fails.
+    """
+    try:
+        from networkx.algorithms import community as nx_community
+
+        # Louvain needs an undirected graph
+        UG = G.to_undirected()
+
+        # Copy edge weights
+        for u, v, data in G.edges(data=True):
+            w = data.get("weight", 1.0)
+            if UG.has_edge(u, v):
+                UG[u][v]["weight"] = max(UG[u][v].get("weight", 1.0), w)
+
+        communities = nx_community.louvain_communities(UG, weight="weight", seed=42)
+        community_map: dict[int, int] = {}
+        for cid, members in enumerate(communities):
+            for node_id in members:
+                community_map[node_id] = cid
+
+        print(f"[Clustering] Louvain found {len(communities)} communities.")
+        return community_map
+
+    except Exception as e:
+        print(f"[WARN] Louvain failed ({e}), falling back to weakly connected components.")
+        return _fallback_connected_components(G)
+
+
+def _fallback_connected_components(G: nx.DiGraph) -> dict[int, int]:
+    """Last-resort fallback: weakly connected components as communities."""
     community_map: dict[int, int] = {}
     for cid, component in enumerate(nx.weakly_connected_components(G)):
         for node_id in component:
@@ -262,6 +293,83 @@ def trace_execution_flows(G: nx.DiGraph, clusters: list[dict]) -> list[dict]:
 # Main clustering orchestration
 # ---------------------------------------------------------------------------
 
+def _semantic_cluster(
+    nodes: list[dict],
+    embeddings: np.ndarray,
+    node_id_to_index: dict[int, int],
+) -> dict[int, int]:
+    """
+    Pure semantic clustering using HDBSCAN on embedding vectors.
+    Used when the graph has too few edges to cluster topologically.
+    Noise points (-1) each become their own singleton cluster.
+    """
+    try:
+        import hdbscan
+        from sklearn.preprocessing import normalize
+
+        n = len(nodes)
+        if n < 3:
+            return {node["id"]: i for i, node in enumerate(nodes)}
+
+        indices = [node_id_to_index[node["id"]] for node in nodes]
+        vectors = normalize(embeddings[indices])
+
+        # min_cluster_size scales with codebase — roughly sqrt(n)/2, min 3
+        min_cs = max(3, int(n ** 0.5) // 2)
+
+        clusterer = hdbscan.HDBSCAN(
+            min_cluster_size=min_cs,
+            min_samples=2,
+            metric="euclidean",
+            cluster_selection_method="eom",
+        )
+        labels = clusterer.fit_predict(vectors)
+
+        # Assign noise points to unique singleton clusters
+        next_cid = int(labels.max()) + 1 if labels.max() >= 0 else 0
+        community_map: dict[int, int] = {}
+        for i, node in enumerate(nodes):
+            lbl = int(labels[i])
+            if lbl == -1:
+                community_map[node["id"]] = next_cid
+                next_cid += 1
+            else:
+                community_map[node["id"]] = lbl
+
+        n_clusters = len(set(community_map.values()))
+        print(f"[Clustering] Semantic HDBSCAN found {n_clusters} communities.")
+        return community_map
+
+    except ImportError as e:
+        print(f"[WARN] HDBSCAN not available ({e}), using directory-based grouping.")
+        return _directory_based_grouping(nodes)
+    except Exception as e:
+        print(f"[WARN] Semantic clustering failed ({e}), using directory-based grouping.")
+        return _directory_based_grouping(nodes)
+
+
+def _directory_based_grouping(nodes: list[dict]) -> dict[int, int]:
+    """
+    Last-resort fallback: group files by their immediate parent directory.
+    Always produces meaningful clusters even with no edges and no ML libs.
+    """
+    from pathlib import Path as _Path
+
+    dir_to_cid: dict[str, int] = {}
+    community_map: dict[int, int] = {}
+    next_cid = 0
+
+    for node in nodes:
+        parent = str(_Path(node["canonical_path"]).parent)
+        if parent not in dir_to_cid:
+            dir_to_cid[parent] = next_cid
+            next_cid += 1
+        community_map[node["id"]] = dir_to_cid[parent]
+
+    print(f"[Clustering] Directory grouping produced {next_cid} communities.")
+    return community_map
+
+
 def cluster_codebase(
     nodes: list[dict],
     edges: list[dict],
@@ -277,8 +385,18 @@ def cluster_codebase(
     G = build_graph(nodes, edges)
     G = penalize_god_files(G)
 
-    # Leiden partitioning
-    community_map = run_leiden(G)
+    # If graph has very few edges relative to nodes, supplement with
+    # semantic-only clustering so we don't degenerate to N singletons.
+    edge_density = len(edges) / max(len(nodes), 1)
+    if edge_density < 0.05:
+        print(
+            f"[Clustering] Low edge density ({len(edges)} edges / {len(nodes)} nodes). "
+            "Running semantic-only pre-clustering to seed communities."
+        )
+        community_map = _semantic_cluster(nodes, embeddings, node_id_to_index)
+    else:
+        # Leiden / Louvain topological partitioning
+        community_map = run_leiden(G)
 
     # Group nodes by community
     communities: dict[int, list[int]] = {}

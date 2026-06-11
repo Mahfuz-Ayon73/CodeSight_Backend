@@ -24,6 +24,7 @@ from modules.ingestion import crawl, save_registry
 from modules.parser import parse_codebase
 from modules.clustering import cluster_codebase
 from modules.summarizer import label_clusters, get_llm_provider
+from cluster_analytics import generate as generate_analytics
 
 
 # ---------------------------------------------------------------------------
@@ -210,6 +211,9 @@ def run_analysis(
     elapsed = round(time.time() - start, 2)
     print(f"\n[Done] graph_blueprint.json written to {blueprint_path}")
     print(f"[Done] Analysis completed in {elapsed}s")
+
+    # Generate cluster analytics alongside the blueprint
+    generate_analytics(str(blueprint_path))
 
     # Phase 5: Cleanup — purge source files (Transient Lifecycle)
     if purge_after:
