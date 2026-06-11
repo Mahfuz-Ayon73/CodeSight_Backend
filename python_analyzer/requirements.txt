@@ -9,6 +9,11 @@ numpy>=2.3.0
 scikit-learn>=1.5.0
 hdbscan>=0.8.43
 
+# Dimensionality reduction for multi-view clustering matrix
+# UMAP compresses 384-dim embeddings → 3 dense components before HDBSCAN
+# Falls back to PCA (scikit-learn) if unavailable
+umap-learn>=0.5.6
+
 # Embeddings
 sentence-transformers==3.3.1
 
@@ -18,6 +23,4 @@ uvicorn==0.32.1
 python-dotenv==1.0.1
 
 # NOTE: leidenalg and igraph are NOT included — no cp314 wheels exist for them.
-# The system automatically falls back to NetworkX connected-components clustering.
-# If you want Leiden clustering later, install Python 3.11 alongside 3.14 and
-# create a separate venv: python3.11 -m venv venv311
+# The system automatically falls back to Louvain (NetworkX) clustering.

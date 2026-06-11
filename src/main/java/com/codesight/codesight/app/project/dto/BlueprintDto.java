@@ -1,5 +1,6 @@
 package com.codesight.codesight.app.project.dto;
 
+import com.fasterxml.jackson.annotation.JsonIgnoreProperties;
 import com.fasterxml.jackson.annotation.JsonProperty;
 import lombok.Data;
 
@@ -74,6 +75,7 @@ public class BlueprintDto {
     }
 
     @Data
+    @JsonIgnoreProperties(ignoreUnknown = true)
     public static class ClusterDto {
         @JsonProperty("cluster_id")
         private String clusterId;
@@ -88,5 +90,8 @@ public class BlueprintDto {
         private List<Integer> nodeIds;
 
         private List<String> nodes;
+
+        @JsonProperty("referenced_by_clusters")
+        private List<String> referencedByClusters;
     }
 }

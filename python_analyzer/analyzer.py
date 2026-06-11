@@ -20,8 +20,8 @@ import sys
 import time
 from pathlib import Path
 
-from modules.ingestion import crawl, save_registry
-from modules.parser import parse_codebase
+from modules.ingestion import crawl, save_registry, partition_registry
+from modules.parser import parse_codebase, detect_module_system
 from modules.clustering import cluster_codebase
 from modules.summarizer import label_clusters, get_llm_provider
 from cluster_analytics import generate as generate_analytics
@@ -78,13 +78,17 @@ def build_blueprint(
     id_to_path = {n["id"]: n["canonical_path"] for n in nodes}
     enriched_clusters = []
     for cluster in clusters:
-        enriched_clusters.append({
+        enriched = {
             "cluster_id": cluster["cluster_id"],
             "suggested_title": cluster["suggested_title"],
             "functional_summary": cluster["functional_summary"],
             "node_ids": cluster["node_ids"],
             "nodes": [id_to_path[nid] for nid in cluster["node_ids"] if nid in id_to_path],
-        })
+        }
+        # Preserve shared-dependency annotation if present
+        if "referenced_by_clusters" in cluster:
+            enriched["referenced_by_clusters"] = cluster["referenced_by_clusters"]
+        enriched_clusters.append(enriched)
 
     return {
         "schema_version": "1.0",
@@ -103,9 +107,16 @@ def build_blueprint(
 
 
 def _detect_paradigm(repo_root: str) -> str:
-    """Heuristic paradigm detection from package.json dependencies."""
+    """
+    Detect project paradigm from package.json dependencies.
+    Also checks module_system (CommonJS vs ESM) via source file sampling.
+    """
     pkg_path = Path(repo_root) / "package.json"
     if not pkg_path.exists():
+        # No package.json — fall back to module system detection
+        module_sys = detect_module_system(repo_root, {})
+        if module_sys == "commonjs":
+            return "WEB_API_NODEJS_CJS"
         return "UNKNOWN"
     try:
         with open(pkg_path, "r", encoding="utf-8") as f:
@@ -115,15 +126,28 @@ def _detect_paradigm(repo_root: str) -> str:
             **pkg.get("devDependencies", {}),
         }
         keys = set(all_deps.keys())
+
+        # Framework detection (most specific first)
         if "next" in keys:
             return "WEB_FRAMEWORK_NEXTJS"
         if "react" in keys:
             return "WEB_FRAMEWORK_REACT"
-        if "express" in keys or "fastify" in keys or "koa" in keys:
-            return "WEB_API_NODEJS"
         if "vue" in keys:
             return "WEB_FRAMEWORK_VUE"
-        return "PURE_LIBRARY_OR_PACKAGE"
+        if "express" in keys or "fastify" in keys or "koa" in keys or "hapi" in keys:
+            # Distinguish CJS vs ESM
+            module_type = pkg.get("type", "commonjs")
+            if module_type == "module":
+                return "WEB_API_NODEJS_ESM"
+            return "WEB_API_NODEJS_CJS"
+        if "nestjs" in keys or "@nestjs/core" in keys:
+            return "WEB_FRAMEWORK_NESTJS"
+
+        # Fallback: check package type field
+        module_type = pkg.get("type", "commonjs")
+        if module_type == "module":
+            return "PURE_LIBRARY_ESM"
+        return "PURE_LIBRARY_CJS"
     except Exception:
         return "UNKNOWN"
 
@@ -169,23 +193,38 @@ def run_analysis(
     print(f"  Repo:    {repo_root}")
     print(f"{'='*60}\n")
 
-    # Phase 1: Ingest
+    # Phase 1: Ingest + partition admin files
     print("[Phase 1] Crawling repository...")
     registry = crawl(repo_root)
     if not registry:
         print("[ERROR] No source files found. Aborting.")
         sys.exit(1)
     print(f"[Phase 1] Found {len(registry)} source files.")
+
+    app_registry, admin_registry = partition_registry(registry)
+    print(f"[Phase 1] App files: {len(app_registry)}, Admin/DevOps files: {len(admin_registry)}")
     save_registry(registry, str(output_path / "file_registry.json"))
 
-    # Phase 2: Parse + embed
+    # Phase 2: Parse + embed (parse ALL files for embeddings, but edges only for app files)
     print("[Phase 2] Parsing AST and generating embeddings...")
     nodes, edges, embeddings = parse_codebase(repo_root, registry)
-    print(f"[Phase 2] {len(nodes)} nodes, {len(edges)} internal edges.")
 
-    # Phase 3: Cluster
+    # Split nodes into app vs admin using the partitioned registries
+    admin_id_set = set(admin_registry.values())
+    app_nodes   = [n for n in nodes if n["id"] not in admin_id_set]
+    admin_nodes = [n for n in nodes if n["id"] in admin_id_set]
+    # Keep only edges between app nodes
+    app_id_set = set(app_registry.values())
+    app_edges  = [e for e in edges if e["source_id"] in app_id_set and e["target_id"] in app_id_set]
+
+    print(f"[Phase 2] {len(app_nodes)} app nodes, {len(app_edges)} internal edges, "
+          f"{len(admin_nodes)} admin nodes (bypassed).")
+
+    # Phase 3: Cluster (app nodes only; admin nodes appended as DevOps cluster)
     print("[Phase 3] Building graph and clustering...")
-    graph, clusters, execution_flows = cluster_codebase(nodes, edges, embeddings)
+    graph, clusters, execution_flows = cluster_codebase(
+        app_nodes, app_edges, embeddings, admin_nodes=admin_nodes
+    )
 
     # Phase 4: Label
     print("[Phase 4] Labeling clusters...")
@@ -198,7 +237,7 @@ def run_analysis(
         repo_root=repo_root,
         registry=registry,
         nodes=nodes,
-        edges=edges,
+        edges=app_edges,
         clusters=clusters,
         execution_flows=execution_flows,
         graph=graph,
