@@ -134,10 +134,36 @@ _CALLSITE_QUERY_TEXT = """
             property: (property_identifier) @new_member_call))
 """
 
+# Captures identifiers used as VALUES (arguments, array elements, property values,
+# assignment RHS) — catches middleware/handler reference patterns like:
+#   router.use(authenticate)
+#   router.post('/pay', validate, controller.create)
+#   module.exports = { handler }
+_REF_USAGE_QUERY_TEXT = """
+    (call_expression
+        arguments: (arguments
+            (identifier) @ref_arg))
+
+    (call_expression
+        arguments: (arguments
+            (member_expression
+                object: (identifier) @ref_member_arg)))
+
+    (array
+        (identifier) @ref_array_elem)
+
+    (pair
+        value: (identifier) @ref_obj_value)
+
+    (shorthand_property_identifier) @ref_shorthand
+"""
+
 _CALLSITE_QUERY_CAPTURE_NAMES = {"callee_obj", "member_call", "direct_call", "new_call", "new_obj", "new_member_call"}
+_REF_USAGE_CAPTURE_NAMES      = {"ref_arg", "ref_member_arg", "ref_array_elem", "ref_obj_value", "ref_shorthand"}
 
 _EXPORT_QUERY_CACHE:   dict = {}
 _CALLSITE_QUERY_CACHE: dict = {}
+_REF_USAGE_QUERY_CACHE: dict = {}
 
 
 def _get_export_query(lang):
@@ -157,6 +183,15 @@ def _get_callsite_query(lang):
         except Exception:
             _CALLSITE_QUERY_CACHE[lang] = None
     return _CALLSITE_QUERY_CACHE[lang]
+
+
+def _get_ref_usage_query(lang):
+    if lang not in _REF_USAGE_QUERY_CACHE:
+        try:
+            _REF_USAGE_QUERY_CACHE[lang] = lang.query(_REF_USAGE_QUERY_TEXT)
+        except Exception:
+            _REF_USAGE_QUERY_CACHE[lang] = None
+    return _REF_USAGE_QUERY_CACHE[lang]
 
 
 def _get_language_for_file(canonical: str):
@@ -409,6 +444,46 @@ def _extract_callsites_treesitter(source_code: str, canonical: str) -> set[str]:
         return set()
 
 
+def _extract_ref_usages_treesitter(source_code: str, canonical: str) -> set[str]:
+    """
+    Extract identifiers used as values/references (arguments, array elements,
+    object values) — catches middleware/handler reference patterns:
+        router.use(authenticate)
+        router.post('/pay', validate, paymentController.create)
+        module.exports = { handler }
+
+    Returns a set of binding names whose imports should NOT be marked dead
+    even if they are never directly called.
+    """
+    if not _TS_AVAILABLE:
+        return set()
+    lang = _get_language_for_file(canonical)
+    query = _get_ref_usage_query(lang)
+    if query is None:
+        return set()
+    try:
+        parser_obj = TSParser(lang)
+        tree = parser_obj.parse(bytes(source_code, "utf-8"))
+        captures = query.captures(tree.root_node)
+        refs: set[str] = set()
+        if isinstance(captures, dict):
+            for cap_name, nodes in captures.items():
+                if cap_name in _REF_USAGE_CAPTURE_NAMES:
+                    for node in nodes:
+                        text = node.text.decode("utf-8").strip()
+                        if text and text != "require" and not text[0].isdigit():
+                            refs.add(text)
+        else:
+            for node, cap_name in captures:
+                if cap_name in _REF_USAGE_CAPTURE_NAMES:
+                    text = node.text.decode("utf-8").strip()
+                    if text and text != "require" and not text[0].isdigit():
+                        refs.add(text)
+        return refs
+    except Exception:
+        return set()
+
+
 # ---------------------------------------------------------------------------
 # CommonJS paradigm detection
 # ---------------------------------------------------------------------------
@@ -547,11 +622,15 @@ def parse_codebase(
         # Call-site extraction (what imported bindings are actually invoked)
         callsites = _extract_callsites_treesitter(source_code, canonical) if _TS_AVAILABLE else set()
 
+        # Reference-usage extraction (bindings passed as arguments/values — live but not called directly)
+        ref_usages = _extract_ref_usages_treesitter(source_code, canonical) if _TS_AVAILABLE else set()
+
         file_data[canonical] = {
-            "id":        file_id,
+            "id":          file_id,
             "raw_imports": raw_imports,
-            "exports":   exported_names,
-            "callsites": callsites,
+            "exports":     exported_names,
+            "callsites":   callsites,
+            "ref_usages":  ref_usages,
             "source_code": source_code,
         }
 
@@ -588,6 +667,9 @@ def parse_codebase(
         For `const x = require('./y')` → {'./y': 'x'}
         For `import x from './y'`      → {'./y': 'x'}
         For `import { foo } from './y'`→ {'./y': 'foo'}  (first name only)
+
+        Also builds a flat set of ALL named imports across all paths for
+        destructured-binding liveness checking (see `all_named_bindings` below).
         """
         bindings: dict[str, str] = {}
         for match in _REQUIRE_BINDING_RE.finditer(source_code):
@@ -607,6 +689,48 @@ def parse_codebase(
                 bindings[path] = default_nm
         return bindings
 
+    def _get_all_named_bindings(source_code: str) -> dict[str, set[str]]:
+        """
+        Returns {import_path -> set of ALL local binding names}.
+        Handles:
+          import { foo, bar as baz }  from './x'  → {'./x': {'foo', 'baz'}}
+          const { create, find }      = require('./model') → {'./model': {'create', 'find'}}
+        This ensures destructured names are all tracked for liveness checking.
+        """
+        path_to_names: dict[str, set[str]] = {}
+
+        # ESM named imports: import { foo, bar as localBar } from './x'
+        _ESM_NAMED_RE = re.compile(
+            r"""import\s+\{([^}]+)\}\s+from\s+['"]([^'"]+)['"]""",
+            re.MULTILINE,
+        )
+        for match in _ESM_NAMED_RE.finditer(source_code):
+            named_list, path = match.group(1), match.group(2)
+            names: set[str] = set()
+            for part in named_list.split(","):
+                local = part.strip().split(" as ")[-1].strip()
+                if local:
+                    names.add(local)
+            if names:
+                path_to_names.setdefault(path, set()).update(names)
+
+        # CJS destructured: const { create, find } = require('./model')
+        _CJS_DESTR_RE = re.compile(
+            r"""(?:const|let|var)\s+\{([^}]+)\}\s*=\s*require\s*\(\s*['"]([^'"]+)['"]\s*\)""",
+            re.MULTILINE,
+        )
+        for match in _CJS_DESTR_RE.finditer(source_code):
+            named_list, path = match.group(1), match.group(2)
+            names = set()
+            for part in named_list.split(","):
+                local = part.strip().split(":")[-1].strip()  # handle { foo: localFoo }
+                if local:
+                    names.add(local)
+            if names:
+                path_to_names.setdefault(path, set()).update(names)
+
+        return path_to_names
+
     # Second pass: resolve imports, build enriched edges, fill node fields
     node_index = {n["canonical_path"]: i for i, n in enumerate(nodes)}
 
@@ -616,33 +740,49 @@ def parse_codebase(
         callsites   = fdata["callsites"]
         raw_imports = fdata["raw_imports"]
 
-        bindings = _get_import_bindings(source_code)
+        bindings          = _get_import_bindings(source_code)
+        named_bindings    = _get_all_named_bindings(source_code)  # path → set of all local names
 
         internal_targets: list[str] = []
         external_deps:    list[str] = []
+
+        # Combine callsites + ref_usages — both signal a live import
+        ref_usages   = fdata["ref_usages"]
+        live_symbols = callsites | ref_usages
 
         for imp in raw_imports:
             resolved = resolve_import(imp, canonical, repo_root, registry, aliases)
             if resolved:
                 internal_targets.append(resolved)
 
-                # Determine binding name for this import path
+                # Primary binding (default or namespace import)
                 binding = bindings.get(imp) or bindings.get(imp.rstrip("/")) or ""
 
-                # Is that binding actually called anywhere?
-                is_called = bool(binding and binding in callsites)
+                # All named bindings for this import path (destructured)
+                all_names_for_imp = named_bindings.get(imp, set()) | named_bindings.get(imp.rstrip("/"), set())
 
-                # What names from the target file are referenced in callsites?
+                # Live if: primary binding used, OR any destructured name is live
+                is_live = bool(
+                    (binding and binding in live_symbols) or
+                    any(n in live_symbols for n in all_names_for_imp)
+                )
+
+                # called_names: exported names from target that appear in live symbols
                 target_exports = file_data.get(resolved, {}).get("exports", [])
-                called_names   = [n for n in target_exports if n in callsites]
+                called_names   = [n for n in target_exports if n in live_symbols]
+
+                # Also include any destructured names that are live (even if not in target exports list)
+                for n in all_names_for_imp:
+                    if n in live_symbols and n not in called_names:
+                        called_names.append(n)
 
                 edges.append({
                     "source_id":    file_id,
                     "target_id":    registry[resolved],
                     "weight":       1.0,
-                    "binding":      binding,
+                    "binding":      binding or (next(iter(all_names_for_imp), "") if all_names_for_imp else ""),
                     "called_names": called_names,
-                    "is_dead_import": not is_called and not called_names,
+                    "is_dead_import": not is_live and not called_names,
                 })
             else:
                 parts = imp.lstrip("@").split("/")
@@ -662,4 +802,128 @@ def parse_codebase(
     if dead_count:
         print(f"[Parser] Detected {dead_count} dead import(s) across {len(edges)} edges.")
 
+    # ------------------------------------------------------------------
+    # Step 3: Naming convention synthetic edges
+    # Synthesize edges between files that follow standard MVC/layered
+    # naming conventions but have no static import relationship detected.
+    # e.g. payment.controller.js → payment.model.js (no direct import but
+    # strongly implied by naming pattern across any JS/TS framework).
+    # These edges are flagged is_synthetic=True and weighted lower (0.4).
+    # ------------------------------------------------------------------
+    edges = _inject_naming_convention_edges(edges, nodes, registry)
+
     return nodes, edges, embeddings
+
+
+# ---------------------------------------------------------------------------
+# Naming convention synthetic edge injection
+# ---------------------------------------------------------------------------
+
+# Ordered layer tiers — higher tier depends on lower tier
+_LAYER_TIERS: list[tuple[int, list[str]]] = [
+    (0, ["route", "routes", "router", "routers"]),
+    (1, ["controller", "controllers", "handler", "handlers"]),
+    (2, ["service", "services"]),
+    (3, ["repository", "repositories", "repo", "repos", "dao"]),
+    (4, ["model", "models", "schema", "schemas", "entity", "entities"]),
+]
+
+_TIER_OF: dict[str, int] = {
+    word: tier for tier, words in _LAYER_TIERS for word in words
+}
+
+_DOMAIN_TOKEN_RE = re.compile(r"[A-Z][a-z]+|[a-z]+", re.UNICODE)
+
+
+def _domain_tokens(canonical: str) -> frozenset[str]:
+    """Extract lowercase domain tokens from a file's name (not path layers)."""
+    stem = Path(canonical).stem
+    # Split on dots first (payment.controller.js → ['payment', 'controller'])
+    parts = stem.replace("-", ".").replace("_", ".").split(".")
+    tokens: set[str] = set()
+    for part in parts:
+        # CamelCase split
+        tokens.update(t.lower() for t in _DOMAIN_TOKEN_RE.findall(part))
+    # Remove pure layer words to get domain tokens only
+    return frozenset(t for t in tokens if t not in _TIER_OF and len(t) >= 3)
+
+
+def _file_layer(canonical: str) -> int | None:
+    """Return the layer tier for a file based on naming, or None if unknown."""
+    stem = Path(canonical).stem.lower().replace("-", ".").replace("_", ".")
+    parts = stem.split(".")
+    for part in parts:
+        if part in _TIER_OF:
+            return _TIER_OF[part]
+    # Also check parent directory name
+    parent = Path(canonical).parent.name.lower()
+    if parent in _TIER_OF:
+        return _TIER_OF[parent]
+    return None
+
+
+def _inject_naming_convention_edges(
+    edges: list[dict],
+    nodes: list[dict],
+    registry: dict[str, int],
+) -> list[dict]:
+    """
+    Synthesize edges between files that share domain tokens but sit in
+    different architectural layers (route→controller, controller→service,
+    service→model, etc.) with no existing edge between them.
+
+    Rules:
+    - Both files must have at least one shared domain token (e.g. 'payment')
+    - Source file must be at a higher layer tier than target (route > controller > model)
+    - No existing edge (real or synthetic) already connects them
+    - Minimum 1 shared domain token required
+
+    Synthetic edges are marked is_synthetic=True, is_dead_import=False, weight=0.4.
+    """
+    id_to_canonical = {n["id"]: n["canonical_path"] for n in nodes}
+
+    # Build set of existing directed pairs to avoid duplicates
+    existing_pairs: set[tuple[int, int]] = {
+        (e["source_id"], e["target_id"]) for e in edges
+    }
+
+    # Group files by their domain token set
+    file_info: list[tuple[str, int, frozenset[str], int | None]] = []
+    for canonical, fid in registry.items():
+        tokens = _domain_tokens(canonical)
+        tier   = _file_layer(canonical)
+        if tokens and tier is not None:
+            file_info.append((canonical, fid, tokens, tier))
+
+    synthetic: list[dict] = []
+
+    for i, (src_can, src_id, src_tokens, src_tier) in enumerate(file_info):
+        for j, (tgt_can, tgt_id, tgt_tokens, tgt_tier) in enumerate(file_info):
+            if i == j:
+                continue
+            # Source must be higher tier (closer to route/entry) than target
+            if src_tier >= tgt_tier:
+                continue
+            # Must share at least one domain token
+            shared = src_tokens & tgt_tokens
+            if not shared:
+                continue
+            # Must not already have an edge in this direction
+            if (src_id, tgt_id) in existing_pairs:
+                continue
+
+            synthetic.append({
+                "source_id":    src_id,
+                "target_id":    tgt_id,
+                "weight":       0.4,
+                "binding":      "",
+                "called_names": list(shared),  # shared tokens hint at what connects them
+                "is_dead_import":  False,
+                "is_synthetic":    True,
+            })
+            existing_pairs.add((src_id, tgt_id))
+
+    if synthetic:
+        print(f"[Parser] Injected {len(synthetic)} naming-convention synthetic edge(s).")
+
+    return edges + synthetic
