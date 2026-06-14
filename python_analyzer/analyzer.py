@@ -61,7 +61,7 @@ def build_blueprint(
             "text_summary": node.get("text_summary", ""),
         })
 
-    # Enrich edges with final weights
+    # Enrich edges with final weights and details
     enriched_edges = []
     seen = set()
     for src, tgt, data in graph.edges(data=True):
@@ -71,6 +71,9 @@ def build_blueprint(
                 "source_id": src,
                 "target_id": tgt,
                 "weight": round(data.get("weight", 1.0), 4),
+                "binding": data.get("binding", ""),
+                "called_names": data.get("called_names", []),
+                "is_dead_import": data.get("is_dead_import", False),
             })
             seen.add(key)
 

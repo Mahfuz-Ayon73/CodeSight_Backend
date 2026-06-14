@@ -72,6 +72,14 @@ public class BlueprintDto {
         private Integer targetId;
 
         private Double weight;
+
+        private String binding;
+
+        @JsonProperty("called_names")
+        private List<String> calledNames;
+
+        @JsonProperty("is_dead_import")
+        private Boolean isDeadImport;
     }
 
     @Data

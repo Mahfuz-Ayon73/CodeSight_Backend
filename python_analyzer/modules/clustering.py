@@ -124,8 +124,21 @@ def build_graph(nodes: list[dict], edges: list[dict]) -> nx.DiGraph:
         src, tgt = edge["source_id"], edge["target_id"]
         if G.has_edge(src, tgt):
             G[src][tgt]["weight"] += 1.0
+            if "called_names" in edge:
+                G[src][tgt]["called_names"] = list(set(G[src][tgt].get("called_names", []) + edge["called_names"]))
+            if "binding" in edge:
+                G[src][tgt]["binding"] = edge["binding"]
+            if "is_dead_import" in edge:
+                G[src][tgt]["is_dead_import"] = G[src][tgt].get("is_dead_import", True) and edge["is_dead_import"]
         else:
-            G.add_edge(src, tgt, weight=edge.get("weight", 1.0))
+            G.add_edge(
+                src,
+                tgt,
+                weight=edge.get("weight", 1.0),
+                binding=edge.get("binding", ""),
+                called_names=edge.get("called_names", []),
+                is_dead_import=edge.get("is_dead_import", False)
+            )
     return G
 
 
@@ -485,7 +498,15 @@ def trace_execution_flows(G: nx.DiGraph, clusters: list[dict]) -> list[dict]:
     flow_id = 0
     for cluster in clusters:
         node_ids = set(cluster["node_ids"])
-        sg = G.subgraph(node_ids)
+        # Only take active/non-dead edges for tracing execution flow path
+        active_edges = [
+            (u, v) for u, v in G.edges()
+            if u in node_ids and v in node_ids and not G[u][v].get("is_dead_import", False)
+        ]
+        sg = nx.DiGraph()
+        sg.add_nodes_from(node_ids)
+        sg.add_edges_from(active_edges)
+        
         origins = [n for n in sg.nodes() if sg.in_degree(n) == 0]
         sinks   = {n for n in sg.nodes() if sg.out_degree(n) == 0}
         for origin in origins:
