@@ -1,26 +1,21 @@
 """
-Phase 3: Graph Construction & Domain-Aware Hybrid Clustering
+Phase 3: Graph Construction & Two-Pass Hierarchical Clustering
 
 Pipeline:
-  1. Build weighted DiGraph from AST edges
-  2. Inject test-to-target edge boosts
-  3. Detect shared-dependency god files (high in-degree, zero out-degree)
-     → extracted from clustering, annotated with referencing clusters
-  4. Prune orchestration hubs (server.js / app.js) from clustering view
-  5. Run Louvain on cleaned graph → topological communities
-  6. HDBSCAN validity check on each community > threshold:
-       ONLY runs on topologically connected nodes already in the same community.
-       Asks: are these connected files also semantically cohesive?
-       - One dense region  → keep as-is (valid)
-       - Multiple regions  → split into domain sub-clusters
-       - Noise points (-1) → eject as architectural isolates (singletons)
-     Files with NO edge connections to their cluster are NEVER grouped
-     by semantics — they become singletons.
-  7. Singleton absorption into strongest-edge neighbour
-  8. Orchestrators reassigned by embedding cosine similarity
-  9. God files annotated with clusters that import them
- 10. Execution flow tracing
- 11. Admin/DevOps cluster appended
+  Pass 1 — MERGE (bottom-up): group files by directory ancestry to form
+    domain buckets, then merge small buckets into neighbours by edge weight.
+    This prevents 1,000+ singletons on sparse graphs.
+
+  Pass 2 — SPLIT (top-down): any bucket that exceeds MAX_CLUSTER_SIZE gets
+    Leiden run on its internal subgraph to produce child clusters, recursively,
+    until every leaf is ≤ MAX_CLUSTER_SIZE.
+
+  Final hierarchy:
+    - Each top-level directory group becomes a Level-1 parent cluster.
+    - Oversized groups are split into Level-2+ child clusters.
+    - Every leaf cluster contains 1–MAX_CLUSTER_SIZE files.
+    - Shared deps → c_global_shared.
+    - Admin files → DevOps cluster.
 """
 
 import re as _re
@@ -33,27 +28,12 @@ from collections import defaultdict
 # Constants
 # ---------------------------------------------------------------------------
 
-HDBSCAN_THRESHOLD      = 10     # validate communities larger than this
-LEIDEN_RESOLUTION      = 1.0    # Louvain resolution on pruned graph
-ORCHESTRATOR_OUT_RATIO = 0.15   # hub: out-degree/total_nodes > this AND in-degree==0
-SHARED_DEP_IN_RATIO    = 0.10   # god file: in-degree/total_nodes > this AND out-degree==0
-GOD_FILE_WEIGHT        = 0.05   # edge weight after penalising non-exempt god files
-
-_SEM_WEIGHT   = 0.60
-_STRUC_WEIGHT = 0.40
-_UMAP_COMPONENTS = 10
-
-_ROLE_SCALAR = {
-    "ENTRY_POINT":    1.0,
-    "INTERNAL":       0.0,
-    "TERMINAL_SINK": -1.0,
-}
-
-# ---------------------------------------------------------------------------
-# Domain token extraction — CamelCase + kebab + snake, layer-word filtered
-# Layer words are detected dynamically from the registry, but a minimal
-# bootstrap set handles the very first pass.
-# ---------------------------------------------------------------------------
+MAX_CLUSTER_SIZE       = 30     # split any cluster larger than this
+MIN_CLUSTER_SIZE       = 3      # merge clusters smaller than this into neighbours
+LEIDEN_RESOLUTION      = 1.0
+ORCHESTRATOR_OUT_RATIO = 0.15
+SHARED_DEP_IN_RATIO    = 0.10
+BLOB_EDGE_RATIO        = 0.15   # kept for analytics compatibility
 
 _BOOTSTRAP_LAYER_WORDS = frozenset({
     "src", "app", "lib", "index", "main", "init",
@@ -69,42 +49,30 @@ _BOOTSTRAP_LAYER_WORDS = frozenset({
     "old", "new", "base", "core", "api", "data",
 })
 
+_LAYER_WORDS: frozenset[str] = _BOOTSTRAP_LAYER_WORDS
+
+
+# ---------------------------------------------------------------------------
+# Dynamic layer word detection
+# ---------------------------------------------------------------------------
 
 def build_layer_word_set(all_canonicals: list[str], freq_threshold: float = 0.35) -> frozenset[str]:
-    """
-    Dynamically detect layer words from the full file registry.
-    A token is a layer word if it appears in > freq_threshold fraction of all files.
-    This works for any language/framework: 'view' in Django, 'handler' in Go, etc.
-    """
     from collections import Counter
     token_counts: Counter = Counter()
     n_files = len(all_canonicals)
     if n_files == 0:
         return _BOOTSTRAP_LAYER_WORDS
-
     for canonical in all_canonicals:
         path_str = canonical.replace("\\", "/")
         camel = _re.sub(r"([a-z0-9])([A-Z])", r"\1 \2", path_str)
         camel = _re.sub(r"([A-Z]+)([A-Z][a-z])", r"\1 \2", camel)
         tokens = set(t.lower() for t in _re.findall(r"[a-zA-Z][a-zA-Z0-9]*", camel) if len(t) >= 4)
         token_counts.update(tokens)
-
-    dynamic = frozenset(
-        tok for tok, cnt in token_counts.items()
-        if cnt / n_files >= freq_threshold
-    )
+    dynamic = frozenset(tok for tok, cnt in token_counts.items() if cnt / n_files >= freq_threshold)
     return _BOOTSTRAP_LAYER_WORDS | dynamic
 
 
-_LAYER_WORDS: frozenset[str] = _BOOTSTRAP_LAYER_WORDS  # updated per-run
-
-
 def extract_domain_tokens(canonical: str) -> frozenset[str]:
-    """
-    Extract business-domain tokens from a file path.
-    Splits CamelCase, kebab-case, snake_case. Filters layer words.
-    Works on any naming convention — domain is whatever is left.
-    """
     path_str = canonical.replace("\\", "/")
     camel = _re.sub(r"([a-z0-9])([A-Z])", r"\1 \2", path_str)
     camel = _re.sub(r"([A-Z]+)([A-Z][a-z])", r"\1 \2", camel)
@@ -122,28 +90,45 @@ def build_graph(nodes: list[dict], edges: list[dict]) -> nx.DiGraph:
         G.add_node(node["id"], **node)
     for edge in edges:
         src, tgt = edge["source_id"], edge["target_id"]
+        incoming_type = edge.get("edge_type", "BELONGS_TO_DOMAIN")
+        incoming_weight = float(edge.get("weight", 1.0))
         if G.has_edge(src, tgt):
-            G[src][tgt]["weight"] += 1.0
+            # If ANY contributing edge is RENDERS, the merged edge is RENDERS
+            # (so we never lose the fact that this link is render-only).
+            existing_type = G[src][tgt].get("edge_type", "BELONGS_TO_DOMAIN")
+            if existing_type == "BELONGS_TO_DOMAIN" and incoming_type == "RENDERS":
+                G[src][tgt]["edge_type"] = "RENDERS"
+            # Weight is summed but capped to 0.0 for RENDERS — they stay 0
+            # so community detection still filters them out.
+            if G[src][tgt]["edge_type"] == "RENDERS":
+                G[src][tgt]["weight"] = 0.0
+            else:
+                G[src][tgt]["weight"] += incoming_weight
             if "called_names" in edge:
-                G[src][tgt]["called_names"] = list(set(G[src][tgt].get("called_names", []) + edge["called_names"]))
+                G[src][tgt]["called_names"] = list(
+                    set(G[src][tgt].get("called_names", []) + edge["called_names"])
+                )
             if "binding" in edge:
                 G[src][tgt]["binding"] = edge["binding"]
             if "is_dead_import" in edge:
-                G[src][tgt]["is_dead_import"] = G[src][tgt].get("is_dead_import", True) and edge["is_dead_import"]
+                G[src][tgt]["is_dead_import"] = (
+                    G[src][tgt].get("is_dead_import", True) and edge["is_dead_import"]
+                )
         else:
-            G.add_edge(
-                src,
-                tgt,
-                weight=edge.get("weight", 1.0),
+            initial_type = incoming_type
+            initial_weight = 0.0 if incoming_type == "RENDERS" else incoming_weight
+            G.add_edge(src, tgt,
+                weight=initial_weight,
+                edge_type=initial_type,
                 binding=edge.get("binding", ""),
                 called_names=edge.get("called_names", []),
-                is_dead_import=edge.get("is_dead_import", False)
+                is_dead_import=edge.get("is_dead_import", False),
             )
     return G
 
 
 # ---------------------------------------------------------------------------
-# Test edge-collapse
+# Test edge boosting
 # ---------------------------------------------------------------------------
 
 _TEST_RE = None
@@ -152,65 +137,46 @@ def _is_test_file(canonical: str) -> bool:
     global _TEST_RE
     if _TEST_RE is None:
         _TEST_RE = _re.compile(
-            r"(^|/)(tests?|__tests__|spec)(/|$)|"
-            r"\.(test|spec)\.(js|ts|jsx|tsx|mjs)$",
+            r"(^|/)(tests?|__tests__|spec)(/|$)|\.(test|spec)\.(js|ts|jsx|tsx|mjs)$",
             _re.IGNORECASE,
         )
     return bool(_TEST_RE.search(canonical))
 
 
 def inject_test_edges(G: nx.DiGraph) -> nx.DiGraph:
-    TEST_WEIGHT = 50.0
     n = 0
     for nid in list(G.nodes()):
         if not _is_test_file(G.nodes[nid].get("canonical_path", "")):
             continue
         for tgt in list(G.successors(nid)):
-            G[nid][tgt]["weight"] = TEST_WEIGHT
+            G[nid][tgt]["weight"] = 50.0
             n += 1
     if n:
-        print(f"[Clustering] Edge-collapsed {n} test->target edge(s).")
+        print(f"[Clustering] Boosted {n} test->target edge(s).")
     return G
 
 
 # ---------------------------------------------------------------------------
-# Shared-dependency god file detection
+# Shared-dependency extraction
 # ---------------------------------------------------------------------------
 
 def extract_shared_dependencies(G: nx.DiGraph) -> tuple[nx.DiGraph, list[int]]:
-    """
-    Detect shared-dependency files: imported by many files, imports nothing.
-    These are pure data/schema sinks (Student.js, Payment.js, logger.js).
-
-    They don't belong to any single cluster — they're cross-cluster references.
-    Extract them from the clustering graph so they don't distort communities.
-
-    Returns: (graph_without_god_nodes, list_of_god_node_ids)
-    """
     n_total = G.number_of_nodes()
     if n_total == 0:
         return G, []
-
     shared_dep_ids: list[int] = []
     G_clean = G.copy()
-
     for nid in list(G.nodes()):
-        in_d  = G.in_degree(nid)
-        out_d = G.out_degree(nid)
-        # Shared dependency: many importers, imports nothing itself
+        in_d, out_d = G.in_degree(nid), G.out_degree(nid)
         if out_d == 0 and (in_d / n_total) > SHARED_DEP_IN_RATIO:
             shared_dep_ids.append(nid)
-            G.nodes[nid]["execution_role"] = "SHARED_DEPENDENCY"
-            G.nodes[nid]["is_god_file"] = True
+            G.nodes[nid]["execution_role"]   = "SHARED_DEPENDENCY"
+            G.nodes[nid]["is_god_file"]      = True
             G.nodes[nid]["centrality_score"] = round(in_d / n_total, 4)
-
-    # Remove god nodes from the clustering graph entirely
     G_clean.remove_nodes_from(shared_dep_ids)
-
     if shared_dep_ids:
         names = [Path(G.nodes[n].get("canonical_path", str(n))).name for n in shared_dep_ids]
-        print(f"[Clustering] Extracted {len(shared_dep_ids)} shared-dependency file(s): {names}")
-
+        print(f"[Clustering] Extracted {len(shared_dep_ids)} shared dep(s) → c_global_shared: {names}")
     return G_clean, shared_dep_ids
 
 
@@ -219,27 +185,18 @@ def extract_shared_dependencies(G: nx.DiGraph) -> tuple[nx.DiGraph, list[int]]:
 # ---------------------------------------------------------------------------
 
 def prune_orchestrators(G: nx.DiGraph) -> tuple[nx.DiGraph, list[int]]:
-    """
-    Remove outgoing edges of entry-point hubs (server.js, app.js) that fan
-    out to >ORCHESTRATOR_OUT_RATIO of the graph. Without pruning, Louvain
-    sees one connected pyramid and refuses to cut it.
-    """
     n_total = G.number_of_nodes()
     if n_total == 0:
         return G, []
-
     pruned_ids: list[int] = []
     G_pruned = G.copy()
-
     for nid in list(G.nodes()):
-        in_d  = G.in_degree(nid)
-        out_d = G.out_degree(nid)
+        in_d, out_d = G.in_degree(nid), G.out_degree(nid)
         if in_d == 0 and (out_d / n_total) > ORCHESTRATOR_OUT_RATIO:
             G_pruned.remove_edges_from(list(G_pruned.out_edges(nid)))
             pruned_ids.append(nid)
             name = Path(G.nodes[nid].get("canonical_path", str(nid))).name
-            print(f"[Clustering] Pruned orchestrator: {name} (out={out_d}, ratio={out_d/n_total:.2f})")
-
+            print(f"[Clustering] Pruned orchestrator: {name} (out={out_d})")
     return G_pruned, pruned_ids
 
 
@@ -259,10 +216,23 @@ def _assign_global_roles(G: nx.DiGraph) -> None:
 
 
 # ---------------------------------------------------------------------------
-# Louvain / Leiden community detection
+# Community detection
 # ---------------------------------------------------------------------------
 
-def run_leiden(G: nx.DiGraph) -> dict[int, int]:
+def _is_structural_edge(data: dict) -> bool:
+    """
+    Return True if this edge should participate in community detection.
+
+    Only "BELONGS_TO_DOMAIN" edges (weight > 0) count. "RENDERS" edges
+    are preserved on the graph but stripped here so shared UI imports
+    don't collapse all pages into one mega-cluster.
+    """
+    if data.get("edge_type") == "RENDERS":
+        return False
+    return float(data.get("weight", 1.0)) > 0.0
+
+
+def run_leiden(G: nx.DiGraph, resolution: float = LEIDEN_RESOLUTION) -> dict[int, int]:
     try:
         import igraph as ig
         import leidenalg
@@ -272,45 +242,49 @@ def run_leiden(G: nx.DiGraph) -> dict[int, int]:
         id_to_idx = {nid: i for i, nid in enumerate(node_ids)}
         edges_ig, weights_ig = [], []
         for src, tgt, data in G.edges(data=True):
+            if not _is_structural_edge(data):
+                continue
             edges_ig.append((id_to_idx[src], id_to_idx[tgt]))
             weights_ig.append(float(data.get("weight", 1.0)))
         if not edges_ig:
-            return _fallback_louvain(G)
+            return _fallback_louvain(G, resolution)
         ig_graph = ig.Graph(n=len(node_ids), edges=edges_ig, directed=True)
         ig_graph.es["weight"] = weights_ig
         partition = leidenalg.find_partition(
             ig_graph, leidenalg.RBConfigurationVertexPartition,
-            weights="weight", resolution_parameter=LEIDEN_RESOLUTION, seed=42,
+            weights="weight", resolution_parameter=resolution, seed=42,
         )
         community_map: dict[int, int] = {}
         for cid, members in enumerate(partition):
             for idx in members:
                 community_map[node_ids[idx]] = cid
-        print(f"[Clustering] Leiden found {len(partition)} communities.")
         return community_map
     except ImportError:
-        return _fallback_louvain(G)
+        return _fallback_louvain(G, resolution)
     except Exception as e:
         print(f"[WARN] Leiden failed ({e}), using Louvain.")
-        return _fallback_louvain(G)
+        return _fallback_louvain(G, resolution)
 
 
-def _fallback_louvain(G: nx.DiGraph) -> dict[int, int]:
+def _fallback_louvain(G: nx.DiGraph, resolution: float = LEIDEN_RESOLUTION) -> dict[int, int]:
     try:
         from networkx.algorithms import community as nx_community
         UG = G.to_undirected()
         for u, v, data in G.edges(data=True):
-            w = data.get("weight", 1.0)
+            if not _is_structural_edge(data):
+                continue
+            w = float(data.get("weight", 1.0))
             if UG.has_edge(u, v):
                 UG[u][v]["weight"] = max(UG[u][v].get("weight", 1.0), w)
-        communities = nx_community.louvain_communities(
-            UG, weight="weight", resolution=LEIDEN_RESOLUTION, seed=42
-        )
+            else:
+                UG.add_edge(u, v, weight=w)
+        if UG.number_of_edges() == 0:
+            return _fallback_connected_components(G)
+        communities = nx_community.louvain_communities(UG, weight="weight", resolution=resolution, seed=42)
         community_map: dict[int, int] = {}
         for cid, members in enumerate(communities):
             for nid in members:
                 community_map[nid] = cid
-        print(f"[Clustering] Louvain found {len(communities)} communities.")
         return community_map
     except Exception as e:
         print(f"[WARN] Louvain failed ({e}), using connected components.")
@@ -326,208 +300,200 @@ def _fallback_connected_components(G: nx.DiGraph) -> dict[int, int]:
 
 
 # ---------------------------------------------------------------------------
-# HDBSCAN validity check  ← TOPOLOGY-GATED
+# Pass 1 — Directory-seeded merge (bottom-up grouping)
 # ---------------------------------------------------------------------------
 
-def _connectivity_filter(community_nodes: list[int], G: nx.DiGraph) -> tuple[list[int], list[int]]:
+def _canonical_bucket(canonical: str, depth: int = 2) -> str:
     """
-    Split community into:
-      - connected:    nodes reachable from at least one other member via edges
-      - disconnected: nodes with zero edges to any other member (architectural isolates)
-
-    Disconnected nodes become singletons — never grouped by semantics.
+    Return the top-N directory components as a bucket key.
+    Files at root level go into their own stem bucket.
     """
-    node_set = set(community_nodes)
-    connected, disconnected = [], []
-    for nid in community_nodes:
-        has_edge = (
-            any(tgt in node_set for tgt in G.successors(nid)) or
-            any(src in node_set for src in G.predecessors(nid))
-        )
-        if has_edge:
-            connected.append(nid)
-        else:
-            disconnected.append(nid)
-    return connected, disconnected
+    parts = Path(canonical.replace("\\", "/")).parts
+    if len(parts) <= 1:
+        return Path(canonical).stem
+    return "/".join(parts[:depth])
 
 
-def validate_with_hdbscan(
-    community_nodes: list[int],
-    embeddings: np.ndarray,
-    node_id_to_index: dict[int, int],
-    G: nx.DiGraph,
-) -> dict[int, int]:
+def _directory_seed_groups(G: nx.DiGraph) -> dict[str, list[int]]:
     """
-    HDBSCAN as a VALIDITY CHECKER on an already-topological community.
+    Adaptive-depth directory grouping.
 
-    Pre-condition: all nodes in community_nodes are edge-connected to at least
-    one other member (enforced by _connectivity_filter before calling this).
+    Strategy:
+    1. Start at depth 2 (e.g. 'apps/web', 'packages/ui').
+    2. For any bucket that is still > LARGE_BUCKET_THRESHOLD, drill one
+       level deeper (depth 3) for those nodes only.
+    3. Repeat once more (depth 4) if still oversized.
 
-    What it does:
-    - One dense semantic region  → community is valid, keep as single cluster (label 0)
-    - Multiple dense regions     → community spans multiple domains, split them
-    - Noise points (-1)          → semantically alien despite edge connection, eject
-
-    The multi-view matrix uses:
-      - 60% semantic (UMAP on embeddings) — domain vocabulary gravity
-      - 40% structural (centrality, role, degrees) — architectural position
-      - Cross-domain repulsion: pairs with no direct edge AND different domain
-        tokens get pushed apart
+    This handles monorepos where one top-level directory contains thousands
+    of files: 'apps/web' → 'apps/web/components', 'apps/web/lib', etc.
     """
-    try:
-        import hdbscan as hdb
-        from sklearn.preprocessing import MinMaxScaler
+    LARGE_BUCKET_THRESHOLD = MAX_CLUSTER_SIZE * 5  # 150 files
 
-        n = len(community_nodes)
-        if n < 3:
-            return {nid: 0 for nid in community_nodes}
+    # Initial depth-2 grouping
+    buckets: dict[str, list[int]] = defaultdict(list)
+    for nid in G.nodes():
+        canonical = G.nodes[nid].get("canonical_path", "")
+        key = _canonical_bucket(canonical, depth=2)
+        buckets[key].append(nid)
 
-        valid_nodes = [nid for nid in community_nodes if nid in node_id_to_index]
-        if len(valid_nodes) < 3:
-            return {nid: 0 for nid in community_nodes}
-
-        indices = [node_id_to_index[nid] for nid in valid_nodes]
-        raw_emb = embeddings[indices]
-
-        # --- Semantic compression ---
-        actual_comp = min(_UMAP_COMPONENTS, len(valid_nodes) - 1, raw_emb.shape[1])
-        try:
-            import umap
-            sem = umap.UMAP(
-                n_components=actual_comp,
-                n_neighbors=min(15, len(valid_nodes) - 1),
-                min_dist=0.05,
-                metric="cosine",
-                random_state=42,
-                verbose=False,
-            ).fit_transform(raw_emb)
-        except ImportError:
-            try:
-                from sklearn.decomposition import PCA
-                sem = PCA(n_components=actual_comp, random_state=42).fit_transform(raw_emb)
-            except Exception:
-                sem = raw_emb[:, :actual_comp].copy()
-
-        sem = MinMaxScaler().fit_transform(sem)
-
-        # --- Structural features ---
-        max_c   = max((G.nodes[nid].get("centrality_score", 0.0) for nid in valid_nodes), default=1.0) or 1.0
-        in_deg  = np.array([G.in_degree(nid)  for nid in valid_nodes], dtype=float)
-        out_deg = np.array([G.out_degree(nid) for nid in valid_nodes], dtype=float)
-        max_in  = in_deg.max()  or 1.0
-        max_out = out_deg.max() or 1.0
-
-        struct_rows = []
-        for i, nid in enumerate(valid_nodes):
-            gn = G.nodes[nid]
-            struct_rows.append([
-                gn.get("centrality_score", 0.0) / max_c,
-                (_ROLE_SCALAR.get(gn.get("execution_role", "INTERNAL"), 0.0) + 1.0) / 2.0,
-                in_deg[i]  / max_in,
-                out_deg[i] / max_out,
-            ])
-        struct = MinMaxScaler().fit_transform(np.array(struct_rows, dtype=float))
-
-        combined = np.hstack([sem * _SEM_WEIGHT, struct * _STRUC_WEIGHT])
-
-        # --- Cross-domain repulsion ---
-        node_set = set(valid_nodes)
-        direct_edges = set()
-        for u, v in G.edges():
-            if u in node_set and v in node_set:
-                direct_edges.add((u, v))
-                direct_edges.add((v, u))
-
-        domain_tokens = {
-            nid: extract_domain_tokens(G.nodes[nid].get("canonical_path", ""))
-            for nid in valid_nodes
-        }
-
-        for i, ni in enumerate(valid_nodes):
-            for j, nj in enumerate(valid_nodes):
-                if i >= j:
-                    continue
-                if (ni, nj) not in direct_edges and not (domain_tokens[ni] & domain_tokens[nj]):
-                    combined[i, :actual_comp] = 0.0
-                    combined[j, :actual_comp] = 1.0
-
-        # --- HDBSCAN ---
-        min_cs = max(2, n // 8)
-        labels = hdb.HDBSCAN(
-            min_cluster_size=min_cs,
-            min_samples=1,
-            metric="euclidean",
-            cluster_selection_method="leaf",
-        ).fit_predict(combined)
-
-        # Map results: -1 (noise) → eject as singleton
-        next_cid = int(labels.max()) + 1 if labels.max() >= 0 else 0
-        result: dict[int, int] = {}
-        for i, nid in enumerate(valid_nodes):
-            lbl = int(labels[i])
-            if lbl == -1:
-                result[nid] = next_cid   # singleton
-                next_cid += 1
+    # Drill deeper for oversized buckets
+    for extra_depth in (3, 4):
+        new_buckets: dict[str, list[int]] = {}
+        for key, nids in buckets.items():
+            if len(nids) <= LARGE_BUCKET_THRESHOLD:
+                new_buckets[key] = nids
+                continue
+            # Re-bucket these nodes at a deeper level
+            sub: dict[str, list[int]] = defaultdict(list)
+            for nid in nids:
+                canonical = G.nodes[nid].get("canonical_path", "")
+                sub_key = _canonical_bucket(canonical, depth=extra_depth)
+                sub[sub_key].append(nid)
+            # Only accept the deeper split if it actually produced more groups
+            if len(sub) > 1:
+                new_buckets.update(sub)
             else:
-                result[nid] = lbl
+                new_buckets[key] = nids
+        buckets = new_buckets
 
-        # Any node not in node_id_to_index stays as singleton
-        for nid in community_nodes:
-            if nid not in result:
-                result[nid] = next_cid; next_cid += 1
+    return dict(buckets)
 
-        n_sub = len(set(result.values()))
-        if n_sub > 1:
-            print(f"[Clustering] HDBSCAN split {n} nodes into {n_sub} sub-clusters.")
+
+def _merge_small_buckets(
+    buckets: dict[str, list[int]],
+    G: nx.DiGraph,
+    min_size: int,
+) -> dict[str, list[int]]:
+    """
+    Iteratively absorb buckets smaller than min_size into the neighbour
+    bucket with the highest inter-bucket edge weight.
+    Buckets with no edge neighbours get merged with the closest bucket
+    by directory prefix similarity.
+    """
+    # Build inter-bucket edge weight matrix
+    node_to_bucket = {nid: k for k, nodes in buckets.items() for nid in nodes}
+
+    changed = True
+    while changed:
+        changed = False
+        small = [k for k, v in buckets.items() if 0 < len(v) < min_size]
+        if not small:
+            break
+
+        for sk in small:
+            if sk not in buckets or len(buckets[sk]) == 0:
+                continue
+            if len(buckets[sk]) >= min_size:
+                continue
+
+            # Score each other bucket by total edge weight from sk's nodes.
+            # RENDERS edges are excluded — shared UI imports don't define
+            # feature boundaries.
+            neighbor_w: dict[str, float] = defaultdict(float)
+            for nid in buckets[sk]:
+                for tgt, data in G[nid].items():
+                    if not _is_structural_edge(data):
+                        continue
+                    tb = node_to_bucket.get(tgt)
+                    if tb and tb != sk:
+                        neighbor_w[tb] += float(data.get("weight", 1.0))
+                for src in G.predecessors(nid):
+                    sb = node_to_bucket.get(src)
+                    edata = G[src][nid]
+                    if not _is_structural_edge(edata):
+                        continue
+                    if sb and sb != sk:
+                        neighbor_w[sb] += float(edata.get("weight", 1.0))
+
+            if neighbor_w:
+                best = max(neighbor_w, key=neighbor_w.get)
+            else:
+                # No edge neighbours — merge with most similar directory prefix
+                best = None
+                best_common = -1
+                sk_parts = sk.split("/")
+                for ok in buckets:
+                    if ok == sk:
+                        continue
+                    ok_parts = ok.split("/")
+                    common = sum(1 for a, b in zip(sk_parts, ok_parts) if a == b)
+                    if common > best_common:
+                        best_common, best = common, ok
+
+            if best and best in buckets:
+                buckets[best].extend(buckets[sk])
+                for nid in buckets[sk]:
+                    node_to_bucket[nid] = best
+                del buckets[sk]
+                changed = True
+
+    return {k: v for k, v in buckets.items() if v}
+
+
+# ---------------------------------------------------------------------------
+# Pass 2 — Recursive split (top-down)
+# ---------------------------------------------------------------------------
+
+def _recursive_split(
+    node_ids: list[int],
+    G_full: nx.DiGraph,
+    parent_id: str | None,
+    cluster_counter: list[int],
+    max_size: int,
+) -> list[dict]:
+    """
+    If node_ids <= max_size: return as a single leaf cluster.
+    Otherwise: run Leiden on the internal subgraph → recurse on each sub-community.
+    Falls back to even chunking if Leiden refuses to split.
+    An intermediate parent cluster is created for any group that gets split.
+    """
+    if len(node_ids) <= max_size:
+        cid = f"c_{cluster_counter[0]:04d}"
+        cluster_counter[0] += 1
+        return [{"id": cid, "name": None, "parent_cluster_id": parent_id, "node_ids": node_ids}]
+
+    subgraph = G_full.subgraph(node_ids).copy()
+
+    # Try Leiden at higher resolution first
+    sub_map: dict[int, int] = {}
+    if subgraph.number_of_edges() > 0:
+        sub_map = run_leiden(subgraph, resolution=LEIDEN_RESOLUTION * 1.5)
+
+    sub_communities: dict[int, list[int]] = defaultdict(list)
+    for nid, cid_int in sub_map.items():
+        sub_communities[cid_int].append(nid)
+
+    # If Leiden won't split, force even chunks
+    if len(sub_communities) <= 1:
+        chunks = [node_ids[i:i + max_size] for i in range(0, len(node_ids), max_size)]
+        result = []
+        for chunk in chunks:
+            cid = f"c_{cluster_counter[0]:04d}"
+            cluster_counter[0] += 1
+            result.append({"id": cid, "name": None, "parent_cluster_id": parent_id, "node_ids": chunk})
         return result
 
-    except ImportError as e:
-        print(f"[WARN] HDBSCAN unavailable ({e}). Keeping community as-is.")
-        return {nid: 0 for nid in community_nodes}
-    except Exception as e:
-        print(f"[WARN] HDBSCAN failed ({e}). Keeping community as-is.")
-        return {nid: 0 for nid in community_nodes}
+    # Create an intermediate parent that represents this directory group
+    level_parent_id = f"c_{cluster_counter[0]:04d}"
+    cluster_counter[0] += 1
+    parent_cluster = {
+        "id": level_parent_id,
+        "name": None,
+        "parent_cluster_id": parent_id,
+        "node_ids": node_ids,
+        "_is_intermediate": True,
+    }
 
+    child_clusters: list[dict] = []
+    for sub_nodes in sub_communities.values():
+        if sub_nodes:
+            child_clusters.extend(
+                _recursive_split(sub_nodes, G_full, level_parent_id, cluster_counter, max_size)
+            )
 
-# ---------------------------------------------------------------------------
-# Execution flow tracing
-# ---------------------------------------------------------------------------
-
-def trace_execution_flows(G: nx.DiGraph, clusters: list[dict]) -> list[dict]:
-    flows: list[dict] = []
-    flow_id = 0
-    for cluster in clusters:
-        node_ids = set(cluster["node_ids"])
-        # Only take active/non-dead edges for tracing execution flow path
-        active_edges = [
-            (u, v) for u, v in G.edges()
-            if u in node_ids and v in node_ids and not G[u][v].get("is_dead_import", False)
-        ]
-        sg = nx.DiGraph()
-        sg.add_nodes_from(node_ids)
-        sg.add_edges_from(active_edges)
-        
-        origins = [n for n in sg.nodes() if sg.in_degree(n) == 0]
-        sinks   = {n for n in sg.nodes() if sg.out_degree(n) == 0}
-        for origin in origins:
-            for sink in sinks:
-                if origin == sink:
-                    continue
-                try:
-                    path = nx.shortest_path(sg, origin, sink)
-                    if len(path) > 1:
-                        flows.append({
-                            "flow_id": f"flow_{flow_id:03d}",
-                            "cluster_id": cluster["cluster_id"],
-                            "origin_node_id": origin,
-                            "execution_path": path[1:-1],
-                            "terminal_sink_id": sink,
-                        })
-                        flow_id += 1
-                        break
-                except nx.NetworkXNoPath:
-                    pass
-    return flows
+    print(f"[Clustering] Split {len(node_ids)}-node group → "
+          f"{len(child_clusters)} children under {level_parent_id}")
+    return [parent_cluster] + child_clusters
 
 
 # ---------------------------------------------------------------------------
@@ -541,92 +507,66 @@ def cluster_codebase(
     admin_nodes: list[dict] | None = None,
 ) -> tuple[nx.DiGraph, list[dict], list[dict]]:
     """
-    Domain-aware clustering pipeline.
+    Two-pass hierarchical clustering:
+      Pass 1 (merge): seed clusters from directory structure, merge tiny ones.
+      Pass 2 (split): recursively split any group > MAX_CLUSTER_SIZE.
 
-    Clustering rules:
-    - A file is in a cluster ONLY if it has at least one import edge to another member.
-    - HDBSCAN runs ONLY on topologically connected communities to validate/split them.
-    - Unconnected files become singletons (architectural isolates).
-    - Shared-dependency god files (high in-degree, zero out-degree) are extracted
-      from clustering entirely and annotated with their referencing clusters.
-    - Orchestration hubs (server.js) are pruned before Louvain then reassigned.
+    Guarantees:
+      - Every leaf cluster has 1–MAX_CLUSTER_SIZE files.
+      - Total cluster count is bounded: roughly n_files / avg_cluster_size.
+      - Works even on sparse graphs (edge density < 0.05).
     """
     global _LAYER_WORDS
-
-    # Build dynamic layer word set from this specific codebase
     all_paths = [n["canonical_path"] for n in nodes]
     _LAYER_WORDS = build_layer_word_set(all_paths)
 
     node_id_to_index = {node["id"]: i for i, node in enumerate(nodes)}
 
-    # Phase A: build full graph, assign roles, boost test edges
+    # Build graph
     G = build_graph(nodes, edges)
     _assign_global_roles(G)
     G = inject_test_edges(G)
 
-    edge_density = len(edges) / max(len(nodes), 1)
+    # Extract shared deps and orchestrators
+    G_cluster, shared_dep_ids = extract_shared_dependencies(G)
+    G_pruned, pruned_ids = prune_orchestrators(G_cluster)
 
-    if edge_density < 0.05:
-        print(f"[Clustering] Low edge density ({len(edges)}/{len(nodes)}). Directory fallback.")
-        community_map = _fallback_connected_components(G)
-        pruned_ids: list[int] = []
-        shared_dep_ids: list[int] = []
-        G_cluster = G
-    else:
-        # Phase B: extract shared-dependency god files
-        G_cluster, shared_dep_ids = extract_shared_dependencies(G)
+    # ------------------------------------------------------------------
+    # Pass 1 — Directory-seeded merge
+    # ------------------------------------------------------------------
+    raw_buckets = _directory_seed_groups(G_pruned)
+    print(f"[Clustering] Pass 1: {len(raw_buckets)} directory buckets from {len(G_pruned)} nodes.")
 
-        # Phase C: prune orchestration hubs
-        G_pruned, pruned_ids = prune_orchestrators(G_cluster)
+    merged_buckets = _merge_small_buckets(raw_buckets, G_pruned, min_size=MIN_CLUSTER_SIZE)
+    print(f"[Clustering] Pass 1 after merge: {len(merged_buckets)} buckets.")
 
-        # Phase D: Louvain on cleaned graph
-        community_map = run_leiden(G_pruned)
+    # ------------------------------------------------------------------
+    # Pass 2 — Recursive split
+    # ------------------------------------------------------------------
+    cluster_counter = [0]
+    all_clusters: list[dict] = []
 
-    # Phase E: for each community, separate connected from disconnected nodes
-    communities: dict[int, list[int]] = {}
-    for nid, cid in community_map.items():
-        communities.setdefault(cid, []).append(nid)
+    for bucket_key, bucket_nodes in sorted(merged_buckets.items()):
+        produced = _recursive_split(
+            bucket_nodes,
+            G_cluster,           # use G_cluster (shared deps removed, orchestrators still present)
+            parent_id=None,      # top-level: no parent
+            cluster_counter=cluster_counter,
+            max_size=MAX_CLUSTER_SIZE,
+        )
+        all_clusters.extend(produced)
 
-    final_clusters: dict[str, list[int]] = {}
-    isolates: list[int] = []  # nodes with no intra-cluster edges → singletons
-    cluster_index = 0
+    # ------------------------------------------------------------------
+    # Reassign pruned orchestrators by embedding cosine
+    # ------------------------------------------------------------------
+    leaf_clusters = [c for c in all_clusters if not c.get("_is_intermediate")]
 
-    for cid, comm_nodes in communities.items():
-        connected, disconnected = _connectivity_filter(comm_nodes, G_cluster)
-
-        # Disconnected nodes are architectural isolates — never grouped semantically
-        isolates.extend(disconnected)
-
-        if not connected:
-            continue
-
-        if len(connected) > HDBSCAN_THRESHOLD:
-            # Phase F: HDBSCAN validity check on connected nodes only
-            sub_labels = validate_with_hdbscan(connected, embeddings, node_id_to_index, G_cluster)
-            sub_groups: dict[int, list[int]] = {}
-            for nid, lbl in sub_labels.items():
-                sub_groups.setdefault(lbl, []).append(nid)
-            for members in sub_groups.values():
-                if members:
-                    final_clusters[f"cluster_{cluster_index:03d}"] = members
-                    cluster_index += 1
-        else:
-            final_clusters[f"cluster_{cluster_index:03d}"] = connected
-            cluster_index += 1
-
-    # Phase G: isolates → each becomes its own singleton cluster
-    for nid in isolates:
-        final_clusters[f"cluster_{cluster_index:03d}"] = [nid]
-        cluster_index += 1
-
-    # Phase H: reassign pruned orchestrators to nearest cluster by embedding cosine
     if pruned_ids and embeddings is not None:
         centroids: dict[str, np.ndarray] = {}
-        for cid_key, members in final_clusters.items():
-            idxs = [node_id_to_index[m] for m in members if m in node_id_to_index]
+        for c in leaf_clusters:
+            idxs = [node_id_to_index[m] for m in c["node_ids"] if m in node_id_to_index]
             if idxs:
-                centroids[cid_key] = embeddings[idxs].mean(axis=0)
-
+                centroids[c["id"]] = embeddings[idxs].mean(axis=0)
         for orch_id in pruned_ids:
             if orch_id not in node_id_to_index:
                 continue
@@ -638,112 +578,114 @@ def cluster_codebase(
                 if sim > best_sim:
                     best_sim, best_cid = sim, cid_key
             if best_cid:
-                final_clusters[best_cid].append(orch_id)
-                name = Path(G.nodes[orch_id].get("canonical_path", str(orch_id))).name
-                print(f"[Clustering] Reassigned orchestrator {name} -> {best_cid}")
+                for c in leaf_clusters:
+                    if c["id"] == best_cid:
+                        c["node_ids"].append(orch_id)
+                        break
             else:
-                final_clusters[f"cluster_{cluster_index:03d}"] = [orch_id]
-                cluster_index += 1
+                cid = f"c_{cluster_counter[0]:04d}"
+                cluster_counter[0] += 1
+                leaf_clusters.append({"id": cid, "name": None, "parent_cluster_id": None, "node_ids": [orch_id]})
 
-    # Phase I: singleton absorption — singletons with a strong edge neighbour get merged
-    node_to_cluster: dict[int, str] = {
-        nid: cid_key
-        for cid_key, members in final_clusters.items()
-        for nid in members
-    }
-    multi_clusters = {k for k, v in final_clusters.items() if len(v) > 1}
+    # ------------------------------------------------------------------
+    # Singleton absorption
+    # ------------------------------------------------------------------
+    node_to_cluster: dict[int, str] = {}
+    for c in leaf_clusters:
+        for nid in c["node_ids"]:
+            node_to_cluster[nid] = c["id"]
 
-    for sk in [k for k, v in final_clusters.items() if len(v) == 1]:
-        if sk not in final_clusters:
-            continue
-        nid = final_clusters[sk][0]
+    multi_ids  = {c["id"] for c in leaf_clusters if len(c["node_ids"]) > 1}
+    id_to_leaf = {c["id"]: c for c in leaf_clusters}
+
+    for c in [c for c in leaf_clusters if len(c["node_ids"]) == 1]:
+        nid = c["node_ids"][0]
         neighbor_w: dict[str, float] = defaultdict(float)
         for tgt, data in G[nid].items():
+            if not _is_structural_edge(data):
+                continue
             tc = node_to_cluster.get(tgt)
-            if tc and tc != sk and tc in multi_clusters:
-                neighbor_w[tc] += data.get("weight", 1.0)
+            if tc and tc != c["id"] and tc in multi_ids:
+                neighbor_w[tc] += float(data.get("weight", 1.0))
         for src in G.predecessors(nid):
+            edata = G[src][nid]
+            if not _is_structural_edge(edata):
+                continue
             sc = node_to_cluster.get(src)
-            if sc and sc != sk and sc in multi_clusters:
-                neighbor_w[sc] += G[src][nid].get("weight", 1.0)
+            if sc and sc != c["id"] and sc in multi_ids:
+                neighbor_w[sc] += float(edata.get("weight", 1.0))
         if neighbor_w:
             best = max(neighbor_w, key=neighbor_w.get)
-            final_clusters[best].append(nid)
-            del final_clusters[sk]
+            id_to_leaf[best]["node_ids"].append(nid)
             node_to_cluster[nid] = best
-            multi_clusters.add(best)
+            multi_ids.add(best)
+            c["node_ids"] = []
 
-    # Phase J: assign final execution roles and build cluster dicts
-    clusters: list[dict] = []
-    for cid_key, node_ids in final_clusters.items():
-        if not node_ids:
-            continue
-        sg = G.subgraph(node_ids)
-        for nid in node_ids:
-            in_d, out_d = sg.in_degree(nid), sg.out_degree(nid)
-            if G.nodes[nid].get("execution_role") == "SHARED_DEPENDENCY":
-                pass  # keep special role
-            elif in_d == 0 and out_d > 0:
-                G.nodes[nid]["execution_role"] = "ENTRY_POINT"
-            elif out_d == 0 and in_d > 0:
-                G.nodes[nid]["execution_role"] = "TERMINAL_SINK"
-            else:
-                G.nodes[nid]["execution_role"] = "INTERNAL"
+    leaf_clusters = [c for c in leaf_clusters if c["node_ids"]]
+    intermediate  = [c for c in all_clusters if c.get("_is_intermediate")]
+    all_clusters  = intermediate + leaf_clusters
 
-        clusters.append({
-            "cluster_id": cid_key,
-            "suggested_title": None,
-            "functional_summary": None,
-            "node_ids": node_ids,
-        })
-
-    # Phase K: annotate shared-dependency god files with their referencing clusters
-    # Build reverse map: god_node_id → [cluster_ids that import it]
+    # ------------------------------------------------------------------
+    # Shared dependencies → c_global_shared
+    # ------------------------------------------------------------------
     if shared_dep_ids:
-        god_to_clusters: dict[int, list[str]] = defaultdict(list)
-        for cid_key, node_ids in [(c["cluster_id"], set(c["node_ids"])) for c in clusters]:
-            for god_id in shared_dep_ids:
-                # Check if any member of this cluster imports the god file
-                if any(G.has_edge(member, god_id) for member in node_ids):
-                    god_to_clusters[god_id].append(cid_key)
+        all_clusters.append({
+            "id":                "c_global_shared",
+            "name":              "Shared Infrastructure",
+            "parent_cluster_id": None,
+            "node_ids":          shared_dep_ids,
+        })
+        for nid in shared_dep_ids:
+            if G.has_node(nid):
+                G.nodes[nid]["execution_role"] = "SHARED_DEPENDENCY"
+                G.nodes[nid]["is_god_file"]    = True
 
-        # Add shared dependencies as a special metadata cluster
-        for god_id in shared_dep_ids:
-            name = Path(G.nodes[god_id].get("canonical_path", str(god_id))).name
-            ref_clusters = god_to_clusters.get(god_id, [])
-            clusters.append({
-                "cluster_id": f"shared_dep_{god_id}",
-                "suggested_title": f"Shared Dependency: {name}",
-                "functional_summary": (
-                    f"Cross-cluster shared dependency imported by "
-                    f"{len(ref_clusters)} cluster(s). Not assigned to any single domain."
-                ),
-                "node_ids": [god_id],
-                "referenced_by_clusters": ref_clusters,
-            })
-        print(f"[Clustering] Annotated {len(shared_dep_ids)} shared-dependency file(s).")
-
-    # Phase L: DevOps cluster
+    # ------------------------------------------------------------------
+    # DevOps cluster
+    # ------------------------------------------------------------------
     if admin_nodes:
         admin_ids = [n["id"] for n in admin_nodes]
         for n in admin_nodes:
             if not G.has_node(n["id"]):
                 G.add_node(n["id"], **n, centrality_score=0.0,
                            is_god_file=False, execution_role="INTERNAL")
-        clusters.append({
-            "cluster_id": f"cluster_{cluster_index:03d}",
-            "suggested_title": "DevOps & Database Migrations",
-            "functional_summary": (
-                f"Contains {len(admin_ids)} administrative file(s): deployment configs, "
-                "database migration scripts, and tooling setup."
-            ),
-            "node_ids": admin_ids,
+        all_clusters.append({
+            "id":                f"c_{cluster_counter[0]:04d}",
+            "name":              "DevOps & Database Migrations",
+            "parent_cluster_id": None,
+            "node_ids":          admin_ids,
         })
-        print(f"[Clustering] Added DevOps cluster with {len(admin_ids)} admin file(s).")
+        cluster_counter[0] += 1
+        print(f"[Clustering] Added DevOps cluster with {len(admin_ids)} file(s).")
 
-    execution_flows = trace_execution_flows(G, clusters)
-    app_clusters = [c for c in clusters if not c["cluster_id"].startswith("shared_dep_")]
-    print(f"[Clustering] Final: {len(app_clusters)} app clusters + "
-          f"{len(shared_dep_ids)} shared deps, "
-          f"{len(execution_flows)} execution flows.")
-    return G, clusters, execution_flows
+    # ------------------------------------------------------------------
+    # Execution roles per cluster subgraph
+    # ------------------------------------------------------------------
+    for c in all_clusters:
+        if c.get("_is_intermediate"):
+            continue
+        sg = G.subgraph(c["node_ids"])
+        for nid in c["node_ids"]:
+            if G.nodes.get(nid, {}).get("execution_role") == "SHARED_DEPENDENCY":
+                continue
+            in_d, out_d = sg.in_degree(nid), sg.out_degree(nid)
+            if in_d == 0 and out_d > 0:
+                G.nodes[nid]["execution_role"] = "ENTRY_POINT"
+            elif out_d == 0 and in_d > 0:
+                G.nodes[nid]["execution_role"] = "TERMINAL_SINK"
+            else:
+                G.nodes[nid]["execution_role"] = "INTERNAL"
+
+    # Strip internal helper key
+    for c in all_clusters:
+        c.pop("_is_intermediate", None)
+
+    n_leaves = len([c for c in all_clusters if not any(
+        other["parent_cluster_id"] == c["id"] for other in all_clusters
+    )])
+    n_parents = len(all_clusters) - n_leaves
+    print(f"[Clustering] Final: {len(all_clusters)} clusters "
+          f"({n_parents} parent, {n_leaves} leaf), "
+          f"{len(shared_dep_ids)} shared dep(s).")
+
+    return G, all_clusters, []

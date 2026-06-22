@@ -169,13 +169,14 @@ def label_clusters(
     """
     For each cluster, find top 5 nodes by centrality score
     and generate a title + summary via LLM or fallback.
+    Uses new schema: cluster["id"] instead of cluster["cluster_id"].
     """
     node_map = {n["id"]: n for n in nodes}
 
     for cluster in clusters:
-        node_ids = cluster["node_ids"]
+        node_ids = cluster.get("node_ids", [])
+        cluster_label = cluster.get("id", "")
 
-        # Sort by centrality score descending, pick top 5
         cluster_nodes = [node_map[nid] for nid in node_ids if nid in node_map]
         top_files = sorted(
             cluster_nodes,
@@ -191,15 +192,21 @@ def label_clusters(
                 if title and summary:
                     cluster["suggested_title"] = title
                     cluster["functional_summary"] = summary
+                    # Also set name if not already set
+                    if not cluster.get("name"):
+                        cluster["name"] = title
                     continue
             except Exception as e:
-                print(f"[WARN] LLM labeling failed for {cluster['cluster_id']}: {e}")
+                print(f"[WARN] LLM labeling failed for {cluster_label}: {e}")
 
         # Fallback
-        cluster["suggested_title"] = _auto_title(cluster["cluster_id"], top_files)
+        auto = _auto_title(cluster_label, top_files)
+        cluster["suggested_title"] = auto
         cluster["functional_summary"] = (
             f"Contains {len(node_ids)} file(s) related to "
             f"{', '.join(set(Path(f['canonical_path']).parent.name for f in top_files[:3])) or 'various modules'}."
         )
+        if not cluster.get("name"):
+            cluster["name"] = auto
 
     return clusters

@@ -41,71 +41,92 @@ def build_blueprint(
     execution_flows: list[dict],
     graph,
 ) -> dict:
-    """Assemble the final graph_blueprint.json schema."""
+    """
+    Assemble the final graph_blueprint.json using a strict flat relational schema.
 
-    # Detect paradigm from package.json
+    Every node appears exactly once in the nodes array with a cluster_id foreign key.
+    Clusters form a hierarchy via parent_cluster_id. No data is duplicated.
+    """
     paradigm = _detect_paradigm(repo_root)
 
-    # Enrich nodes with final graph attributes
-    enriched_nodes = []
+    # Build node_id → cluster_id map from leaf clusters only
+    # (intermediate parent clusters hold the same node_ids as their children — skip them)
+    node_to_cluster: dict[int, str] = {}
+    child_cluster_ids = {c["id"] for c in clusters if c.get("parent_cluster_id") is not None}
+
+    # Assign each node to its most specific (deepest) cluster
+    for cluster in clusters:
+        for nid in cluster.get("node_ids", []):
+            # Only overwrite if this cluster is a child (more specific) or node not yet assigned
+            if nid not in node_to_cluster or cluster["id"] in child_cluster_ids:
+                node_to_cluster[nid] = cluster["id"]
+
+    # Build flat nodes array — each node appears exactly once
+    flat_nodes = []
     for node in nodes:
         nid = node["id"]
         g_node = graph.nodes.get(nid, {})
-        enriched_nodes.append({
-            "id": nid,
-            "canonical_path": node["canonical_path"],
-            "centrality_score": g_node.get("centrality_score", 0),
-            "is_god_file": g_node.get("is_god_file", False),
-            "execution_role": g_node.get("execution_role", "INTERNAL"),
+        flat_nodes.append({
+            "id":                   node["canonical_path"],   # use path as stable string ID
+            "cluster_id":           node_to_cluster.get(nid),
+            "canonical_path":       node["canonical_path"],
+            "centrality_score":     round(g_node.get("centrality_score", 0.0), 4),
+            "is_god_file":          g_node.get("is_god_file", False),
+            "execution_role":       g_node.get("execution_role", "INTERNAL"),
             "external_dependencies": node.get("external_dependencies", []),
-            "text_summary": node.get("text_summary", ""),
+            "text_summary":         node.get("text_summary", ""),
         })
 
-    # Enrich edges with final weights and details
-    enriched_edges = []
-    seen = set()
+    # Build flat edges array — use canonical paths as source/target.
+    # `type` carries the Dual-Edge signal: "BELONGS_TO_DOMAIN" for
+    # structural clustering links (weight 1.0), "RENDERS" for page→UI
+    # usage links (weight 0.0, hidden from Leiden but preserved for
+    # downstream queries).
+    id_to_path = {n["id"]: n["canonical_path"] for n in nodes}
+    flat_edges = []
+    seen: set[tuple] = set()
     for src, tgt, data in graph.edges(data=True):
         key = (src, tgt)
-        if key not in seen:
-            enriched_edges.append({
-                "source_id": src,
-                "target_id": tgt,
-                "weight": round(data.get("weight", 1.0), 4),
-                "binding": data.get("binding", ""),
-                "called_names": data.get("called_names", []),
+        if key in seen:
+            continue
+        seen.add(key)
+        src_path = id_to_path.get(src)
+        tgt_path = id_to_path.get(tgt)
+        if src_path and tgt_path:
+            flat_edges.append({
+                "source":         src_path,
+                "target":         tgt_path,
+                "type":           data.get("edge_type", "BELONGS_TO_DOMAIN"),
+                "weight":         round(data.get("weight", 1.0), 4),
+                "binding":        data.get("binding", ""),
+                "called_names":   data.get("called_names", []),
                 "is_dead_import": data.get("is_dead_import", False),
             })
-            seen.add(key)
 
-    # Enrich clusters with canonical paths
-    id_to_path = {n["id"]: n["canonical_path"] for n in nodes}
-    enriched_clusters = []
+    # Build flat clusters array — no embedded node objects, only metadata
+    flat_clusters = []
     for cluster in clusters:
-        enriched = {
-            "cluster_id": cluster["cluster_id"],
-            "suggested_title": cluster["suggested_title"],
-            "functional_summary": cluster["functional_summary"],
-            "node_ids": cluster["node_ids"],
-            "nodes": [id_to_path[nid] for nid in cluster["node_ids"] if nid in id_to_path],
-        }
-        # Preserve shared-dependency annotation if present
-        if "referenced_by_clusters" in cluster:
-            enriched["referenced_by_clusters"] = cluster["referenced_by_clusters"]
-        enriched_clusters.append(enriched)
+        flat_clusters.append({
+            "id":               cluster["id"],
+            "name":             cluster.get("name"),
+            "parent_cluster_id": cluster.get("parent_cluster_id"),
+            "suggested_title":  cluster.get("suggested_title"),
+            "functional_summary": cluster.get("functional_summary"),
+        })
 
     return {
-        "schema_version": "1.0",
+        "schema_version": "2.0",
         "project_id": project_id,
         "project_metadata": {
-            "detected_paradigm": paradigm,
-            "total_nodes_indexed": len(nodes),
-            "total_edges": len(enriched_edges),
-            "total_clusters": len(clusters),
+            "detected_paradigm":   paradigm,
+            "total_nodes_indexed": len(flat_nodes),
+            "total_edges":         len(flat_edges),
+            "total_clusters":      len(flat_clusters),
+            "max_cluster_size":    max((len(c.get("node_ids", [])) for c in clusters), default=0),
         },
-        "nodes": enriched_nodes,
-        "edges": enriched_edges,
-        "clusters": enriched_clusters,
-        "execution_sequences": execution_flows,
+        "clusters": flat_clusters,
+        "nodes":    flat_nodes,
+        "edges":    flat_edges,
     }
 
 

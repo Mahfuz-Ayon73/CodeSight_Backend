@@ -7,6 +7,7 @@ import lombok.Data;
 import java.util.List;
 
 @Data
+@JsonIgnoreProperties(ignoreUnknown = true)
 public class BlueprintDto {
 
     @JsonProperty("schema_version")
@@ -22,10 +23,8 @@ public class BlueprintDto {
     private List<EdgeDto> edges;
     private List<ClusterDto> clusters;
 
-    @JsonProperty("execution_sequences")
-    private List<Object> executionSequences;
-
     @Data
+    @JsonIgnoreProperties(ignoreUnknown = true)
     public static class ProjectMetadata {
         @JsonProperty("detected_paradigm")
         private String detectedParadigm;
@@ -38,11 +37,19 @@ public class BlueprintDto {
 
         @JsonProperty("total_clusters")
         private int totalClusters;
+
+        @JsonProperty("max_cluster_size")
+        private Integer maxClusterSize;
     }
 
     @Data
+    @JsonIgnoreProperties(ignoreUnknown = true)
     public static class NodeDto {
-        private Integer id;
+        // v2 schema: id is a canonical path string
+        private String id;
+
+        @JsonProperty("cluster_id")
+        private String clusterId;
 
         @JsonProperty("canonical_path")
         private String canonicalPath;
@@ -64,15 +71,13 @@ public class BlueprintDto {
     }
 
     @Data
+    @JsonIgnoreProperties(ignoreUnknown = true)
     public static class EdgeDto {
-        @JsonProperty("source_id")
-        private Integer sourceId;
-
-        @JsonProperty("target_id")
-        private Integer targetId;
+        // v2 schema: source/target are canonical path strings
+        private String source;
+        private String target;
 
         private Double weight;
-
         private String binding;
 
         @JsonProperty("called_names")
@@ -80,26 +85,25 @@ public class BlueprintDto {
 
         @JsonProperty("is_dead_import")
         private Boolean isDeadImport;
+
+        private String type;
     }
 
     @Data
     @JsonIgnoreProperties(ignoreUnknown = true)
     public static class ClusterDto {
-        @JsonProperty("cluster_id")
-        private String clusterId;
+        // v2 schema: id replaces cluster_id
+        private String id;
+
+        private String name;
+
+        @JsonProperty("parent_cluster_id")
+        private String parentClusterId;
 
         @JsonProperty("suggested_title")
         private String suggestedTitle;
 
         @JsonProperty("functional_summary")
         private String functionalSummary;
-
-        @JsonProperty("node_ids")
-        private List<Integer> nodeIds;
-
-        private List<String> nodes;
-
-        @JsonProperty("referenced_by_clusters")
-        private List<String> referencedByClusters;
     }
 }

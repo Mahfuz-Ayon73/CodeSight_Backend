@@ -20,239 +20,230 @@ def generate(blueprint_path: str) -> str:
     """
     Generate cluster_analytics.json next to the given blueprint file.
     Returns the path to the written analytics file.
+    Compatible with schema_version 2.0 (flat relational schema).
     """
     try:
         from modules.clustering import LEIDEN_RESOLUTION, BLOB_EDGE_RATIO
     except Exception:
-        LEIDEN_RESOLUTION = 0.8
-        BLOB_EDGE_RATIO = 0.15
+        LEIDEN_RESOLUTION = 1.0
+        BLOB_EDGE_RATIO   = 0.15
+
     blueprint_path = Path(blueprint_path)
     with open(blueprint_path, "r", encoding="utf-8") as f:
         blueprint = json.load(f)
 
-    meta = blueprint.get("project_metadata", {})
-    nodes_by_id = {n["id"]: n for n in blueprint.get("nodes", [])}
-    clusters = blueprint.get("clusters", [])
-    edges = blueprint.get("edges", [])
+    meta          = blueprint.get("project_metadata", {})
+    nodes_list    = blueprint.get("nodes", [])
+    clusters_list = blueprint.get("clusters", [])
+    edges         = blueprint.get("edges", [])
+
+    # Index nodes by their canonical_path (the string ID in v2 schema)
+    nodes_by_id = {n["id"]: n for n in nodes_list}
 
     total_nodes = meta.get("total_nodes_indexed", len(nodes_by_id))
     total_edges = meta.get("total_edges", len(edges))
     edge_density = round(total_edges / max(total_nodes, 1), 4)
 
-    # Build edge set for internal/external counting
-    edge_set = {(e["source_id"], e["target_id"]) for e in edges}
+    # Build edge sets using string path IDs
+    edge_set = {(e["source"], e["target"]) for e in edges}
 
     # Algorithm selection
     if edge_density < 0.05:
-        algorithm_used = "directory_seeded"
+        algorithm_used   = "directory_seeded"
         algorithm_reason = (
             f"Edge density ({edge_density}) is below the 0.05 threshold. "
-            "Topological clustering skipped. Files seeded by directory, "
-            "then merged by strong edges."
+            "Topological clustering skipped. Files seeded by directory."
         )
     else:
-        algorithm_used = "louvain_directory_anchor_merge"
+        algorithm_used   = "leiden_recursive_threshold"
         algorithm_reason = (
-            f"Edge density ({edge_density}) — Louvain community detection, "
-            "followed by directory-anchor split for semantic blobs, "
-            "then strong-edge merge and singleton absorption."
+            f"Edge density ({edge_density}) — Leiden community detection with "
+            f"threshold-driven recursive splitting (MAX_CLUSTER_SIZE={meta.get('max_cluster_size', 30)})."
         )
 
-    # Cluster size stats
-    sizes = [len(c["node_ids"]) for c in clusters]
+    # Build cluster → nodes map from node.cluster_id
+    cluster_to_nodes: dict[str, list[str]] = defaultdict(list)
+    for node in nodes_list:
+        cid = node.get("cluster_id")
+        if cid:
+            cluster_to_nodes[cid].append(node["id"])
+
+    sizes = [len(cluster_to_nodes.get(c["id"], [])) for c in clusters_list]
     size_stats = {
-        "min": min(sizes) if sizes else 0,
-        "max": max(sizes) if sizes else 0,
-        "avg": round(sum(sizes) / len(sizes), 1) if sizes else 0,
-        "singletons": sum(1 for s in sizes if s == 1),
-        "large_clusters_over_15": sum(1 for s in sizes if s > 15),
+        "min":                      min(sizes) if sizes else 0,
+        "max":                      max(sizes) if sizes else 0,
+        "avg":                      round(sum(sizes) / len(sizes), 1) if sizes else 0,
+        "singletons":               sum(1 for s in sizes if s == 1),
+        "large_clusters_over_15":   sum(1 for s in sizes if s > 15),
     }
 
-    # Per-cluster analytics
     cluster_analytics = []
-    for cluster in clusters:
-        cid = cluster["cluster_id"]
-        node_ids = cluster["node_ids"]
-        size = len(node_ids)
+    for cluster in clusters_list:
+        cid      = cluster["id"]
+        node_ids = cluster_to_nodes.get(cid, [])
+        size     = len(node_ids)
         node_set = set(node_ids)
 
-        # Directory distribution
         dir_counts = Counter(
             _get_dir(nodes_by_id[nid]["canonical_path"])
-            for nid in node_ids
-            if nid in nodes_by_id
+            for nid in node_ids if nid in nodes_by_id
         )
         primary_dir = dir_counts.most_common(1)[0][0] if dir_counts else None
 
-        # God files
         god_files = [
             nodes_by_id[nid]["canonical_path"]
             for nid in node_ids
             if nodes_by_id.get(nid, {}).get("is_god_file", False)
         ]
 
-        # Edge counts
         internal_edges = sum(1 for (s, t) in edge_set if s in node_set and t in node_set)
         outgoing_edges = sum(1 for (s, t) in edge_set if s in node_set and t not in node_set)
         incoming_edges = sum(1 for (s, t) in edge_set if s not in node_set and t in node_set)
 
-        # Per-file placement trace
         file_traces = []
         for nid in node_ids:
             node = nodes_by_id.get(nid, {})
             canonical = node.get("canonical_path", "")
             fname = Path(canonical).name if canonical else str(nid)
 
-            # Edges to other members of this cluster
-            internal_out = [(t, w) for (s, t), w in [(( e["source_id"], e["target_id"]), e["weight"]) for e in edges]
-                           if s == nid and t in node_set]
-            internal_in  = [(s, w) for (s, t), w in [(( e["source_id"], e["target_id"]), e["weight"]) for e in edges]
-                           if t == nid and s in node_set]
-            total_internal_connections = len(internal_out) + len(internal_in)
+            internal_out = [(t, e["weight"]) for e in edges if e["source"] == nid and e["target"] in node_set]
+            internal_in  = [(s, e["weight"]) for e in edges if e["target"] == nid and e["source"] in node_set]
+            total_internal = len(internal_out) + len(internal_in)
 
-            # Determine placement reason
-            if total_internal_connections == 0:
-                placement_basis = "semantic"
-                placement_detail = "No direct edges to other cluster members. Placed by embedding similarity."
+            if total_internal == 0:
+                placement_basis  = "semantic"
+                placement_detail = "No direct edges to other cluster members."
             else:
                 parts = []
                 if internal_out:
-                    targets = [Path(nodes_by_id[t]["canonical_path"]).name for t, _ in sorted(internal_out, key=lambda x: -x[1])[:3]]
+                    targets = [Path(nodes_by_id[t]["canonical_path"]).name
+                               for t, _ in sorted(internal_out, key=lambda x: -x[1])[:3]
+                               if t in nodes_by_id]
                     parts.append(f"depends on: {', '.join(targets)}")
                 if internal_in:
-                    sources = [Path(nodes_by_id[s]["canonical_path"]).name for s, _ in sorted(internal_in, key=lambda x: -x[1])[:3]]
+                    sources = [Path(nodes_by_id[s]["canonical_path"]).name
+                               for s, _ in sorted(internal_in, key=lambda x: -x[1])[:3]
+                               if s in nodes_by_id]
                     parts.append(f"imported by: {', '.join(sources)}")
-                placement_basis = "topological"
+                placement_basis  = "topological"
                 placement_detail = "; ".join(parts)
 
             file_traces.append({
-                "file": fname,
-                "canonical_path": canonical,
-                "placement_basis": placement_basis,
-                "placement_detail": placement_detail,
-                "intra_cluster_edges": total_internal_connections,
+                "file":                 fname,
+                "canonical_path":       canonical,
+                "placement_basis":      placement_basis,
+                "placement_detail":     placement_detail,
+                "intra_cluster_edges":  total_internal,
             })
-        # Cohesion basis — derived from per-file placement traces
+
         semantic_count    = sum(1 for f in file_traces if f["placement_basis"] == "semantic")
         topological_count = len(file_traces) - semantic_count
 
         if size == 1:
-            cohesion_basis = "singleton"
+            cohesion_basis  = "singleton"
             cohesion_detail = (
-                f"'{Path(nodes_by_id[node_ids[0]]['canonical_path']).name}' "
+                f"'{Path(nodes_by_id[node_ids[0]]['canonical_path']).name if node_ids and node_ids[0] in nodes_by_id else '?'}' "
                 "had no strong connections to any other community."
             )
         elif topological_count >= semantic_count:
-            cohesion_basis = "topological"
+            cohesion_basis  = "topological"
             cohesion_detail = (
                 f"{topological_count}/{size} files placed by dependency edges, "
                 f"{semantic_count}/{size} by embedding similarity. "
-                f"{internal_edges} intra-cluster edges. "
-                f"Primary directory: {primary_dir}."
+                f"{internal_edges} intra-cluster edges. Primary directory: {primary_dir}."
             )
         else:
-            cohesion_basis = "semantic_blob"
+            cohesion_basis  = "semantic_blob"
             cohesion_detail = (
-                f"{semantic_count}/{size} files have no edges to other cluster members — "
-                "placed by embedding similarity only. "
+                f"{semantic_count}/{size} files have no edges to other cluster members. "
                 f"Only {internal_edges} intra-cluster edges across {size} files. "
                 f"Primary directory: {primary_dir}."
             )
 
         cluster_analytics.append({
-            "cluster_id": cid,
-            "suggested_title": cluster.get("suggested_title"),
+            "cluster_id":         cid,
+            "parent_cluster_id":  cluster.get("parent_cluster_id"),
+            "suggested_title":    cluster.get("suggested_title"),
             "functional_summary": cluster.get("functional_summary"),
-            "size": size,
-            "primary_directory": primary_dir,
+            "size":               size,
+            "primary_directory":  primary_dir,
             "directory_breakdown": dict(dir_counts.most_common()),
-            "god_files": god_files,
+            "god_files":          god_files,
             "edges": {
                 "internal": internal_edges,
                 "outgoing": outgoing_edges,
                 "incoming": incoming_edges,
             },
-            "cohesion_basis": cohesion_basis,
+            "cohesion_basis":  cohesion_basis,
             "cohesion_detail": cohesion_detail,
-            "files": file_traces,
+            "files":           file_traces,
         })
 
-    # Root cause — only report when clustering quality is poor
-    largest = max(cluster_analytics, key=lambda c: c["size"])
+    # Root cause analysis
+    largest    = max(cluster_analytics, key=lambda c: c["size"]) if cluster_analytics else None
     singletons = size_stats["singletons"]
-    singleton_pct = round(singletons / max(len(clusters), 1) * 100)
+    singleton_pct  = round(singletons / max(len(clusters_list), 1) * 100)
     semantic_blobs = [c for c in cluster_analytics if c["cohesion_basis"] == "semantic_blob"]
 
-    if largest["size"] > 15 or singletons > 8 or len(semantic_blobs) > 2:
+    root_cause = None
+    if largest and (largest["size"] > 15 or singletons > 8 or len(semantic_blobs) > 2):
         largest_dirs = len(largest.get("directory_breakdown", {}))
         if total_edges == 0:
             cause = (
                 f"Zero dependency edges extracted across {total_nodes} files. "
-                "All clustering is semantic-only. Verify that require()/import statements "
-                "are present in the source and that tree-sitter is active."
+                "All clustering is semantic-only."
             )
             fixes = [
-                "Check that the repo root path contains actual source files.",
-                "Confirm tree-sitter-typescript is installed: pip show tree-sitter-typescript",
-                "Run with --no-purge and inspect file content manually.",
+                "Verify require()/import statements exist in source files.",
+                "Confirm tree-sitter-typescript is installed.",
             ]
         elif singletons > 8:
             cause = (
-                f"{singletons} singletons ({singleton_pct}% of {len(clusters)} clusters). "
-                f"{total_edges} edges across {total_nodes} files (density={edge_density}). "
-                "Many files have no strong edge connections to any neighbour — "
-                "they are architectural islands (no callers, no callees within the app)."
+                f"{singletons} singletons ({singleton_pct}% of {len(clusters_list)} clusters). "
+                "Many files have no strong edge connections to any neighbour."
             )
             fixes = [
-                "These files may be genuinely isolated (swagger annotations, standalone utilities).",
-                "If they should be grouped, verify their import statements are being parsed.",
-                f"Lower LEIDEN_RESOLUTION below {LEIDEN_RESOLUTION} to coarsen communities further.",
+                "These files may be genuinely isolated utilities.",
+                f"Lower LEIDEN_RESOLUTION below {LEIDEN_RESOLUTION} to coarsen communities.",
             ]
         elif len(semantic_blobs) > 2:
             blob_names = [b["cluster_id"] for b in semantic_blobs[:3]]
             cause = (
-                f"{len(semantic_blobs)} clusters are semantic blobs (majority of members "
-                f"have no intra-cluster edges): {', '.join(blob_names)}. "
-                "The directory-anchor split placed them together but they lack real edges. "
-                "This usually means files in those directories don't import each other."
+                f"{len(semantic_blobs)} clusters are semantic blobs: {', '.join(blob_names)}."
             )
             fixes = [
-                "Check whether those directories actually have cross-file imports.",
-                "Consider merging these clusters manually into a broader 'Utilities' or 'Shared' group.",
-                f"Raise BLOB_EDGE_RATIO threshold to split blobs more aggressively.",
+                "Check whether those directories have cross-file imports.",
+                f"Raise BLOB_EDGE_RATIO to split blobs more aggressively.",
             ]
         else:
             cause = (
-                f"Largest cluster has {largest['size']} files across {largest_dirs} directories. "
-                f"{total_edges} edges, density={edge_density}."
+                f"Largest cluster has {largest['size']} files across {largest_dirs} directories."
             )
             fixes = ["Review directory structure for tighter modular boundaries."]
 
         root_cause = {
-            "cluster_id": largest["cluster_id"],
-            "size": largest["size"],
-            "total_singletons": singletons,
+            "cluster_id":             largest["cluster_id"],
+            "size":                   largest["size"],
+            "total_singletons":       singletons,
             "semantic_blob_clusters": len(semantic_blobs),
-            "explanation": cause,
-            "recommended_fixes": fixes,
+            "explanation":            cause,
+            "recommended_fixes":      fixes,
         }
-    else:
-        root_cause = None
 
     analytics = {
-        "schema_version": "1.0",
-        "project_id": blueprint.get("project_id"),
+        "schema_version": "2.0",
+        "project_id":     blueprint.get("project_id"),
         "summary": {
-            "total_nodes": total_nodes,
-            "total_edges": total_edges,
-            "edge_density": edge_density,
-            "total_clusters": len(clusters),
-            "algorithm_used": algorithm_used,
+            "total_nodes":     total_nodes,
+            "total_edges":     total_edges,
+            "edge_density":    edge_density,
+            "total_clusters":  len(clusters_list),
+            "algorithm_used":  algorithm_used,
             "algorithm_reason": algorithm_reason,
-            "size_stats": size_stats,
+            "size_stats":      size_stats,
         },
-        "clusters": cluster_analytics,
-        "root_cause_analysis": root_cause,
+        "clusters":             cluster_analytics,
+        "root_cause_analysis":  root_cause,
     }
 
     out_path = blueprint_path.parent / "cluster_analytics.json"

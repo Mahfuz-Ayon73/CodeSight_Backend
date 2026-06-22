@@ -22,6 +22,78 @@ from modules.naming_conventions import inject_naming_convention_edges
 
 
 # ---------------------------------------------------------------------------
+# Edge classification (Dual-Edge Signaling)
+# ---------------------------------------------------------------------------
+#
+# Every edge is tagged with one of two `edge_type` values:
+#
+#   "BELONGS_TO_DOMAIN" — clustering weight = 1.0
+#       Connect an entry-point file (page / route / layout) to siblings
+#       inside the SAME feature directory, OR any internal non-UI import.
+#       These edges are the primary signal for community detection.
+#
+#   "RENDERS"           — clustering weight = 0.0 (filtered during Leiden)
+#       Map a page / route / layout to a SHARED UI primitive it imports
+#       (e.g. <TimeSeriesChart/>). These edges survive in the blueprint
+#       for downstream "what does this page render?" Cypher queries, but
+#       are stripped from community detection so pages don't all collapse
+#       into a single mega-cluster through a shared UI library.
+# ---------------------------------------------------------------------------
+
+_ENTRY_POINT_STEMS = frozenset({
+    "page", "layout", "loading", "error", "not-found", "default",
+    "template", "middleware", "route", "global-error", "global-not-found",
+})
+
+_SHARED_UI_DIR_HINTS = (
+    "packages/ui/",
+    "components/ui/",
+    "ui/components/",
+    "src/components/ui/",
+    "lib/components/",
+)
+
+
+def _is_shared_ui_target(target: str) -> bool:
+    """
+    True if the target lives under a shared UI library. We accept
+    either ".../packages/ui/<...>.tsx" (typical monorepo) or
+    ".../packages/ui/src/<...>.tsx" (with an inner src dir).
+    """
+    tgt = target.replace("\\", "/")
+    for hint in _SHARED_UI_DIR_HINTS:
+        if hint in tgt:
+            return True
+    return False
+
+
+def _classify_edge(source_path: str, target_path: str) -> tuple[str, float]:
+    """
+    Return (edge_type, clustering_weight) for a (source, target) import pair.
+
+    Heuristic:
+      1. If target sits in a known shared-UI directory → RENDERS (0.0).
+      2. If source is a Next.js entry-point file (page.tsx / route.ts /
+         layout.tsx / ...) and target is a PascalCase component file →
+         RENDERS (0.0).
+      3. Otherwise → BELONGS_TO_DOMAIN (1.0).
+    """
+    src = source_path.replace("\\", "/")
+    tgt = target_path.replace("\\", "/")
+
+    if _is_shared_ui_target(tgt):
+        return "RENDERS", 0.0
+
+    src_stem = Path(src).stem.lower()
+    if src_stem in _ENTRY_POINT_STEMS:
+        tgt_stem = Path(tgt).stem
+        if tgt_stem and tgt_stem[0].isupper() and tgt_stem.lower() not in _ENTRY_POINT_STEMS:
+            return "RENDERS", 0.0
+
+    return "BELONGS_TO_DOMAIN", 1.0
+
+
+# ---------------------------------------------------------------------------
 # CommonJS / ESM paradigm detection
 # ---------------------------------------------------------------------------
 
@@ -152,10 +224,13 @@ def parse_codebase(
                     if n in live_symbols and n not in called_names:
                         called_names.append(n)
 
+                target_canonical = resolved
+                edge_type, edge_weight = _classify_edge(canonical, target_canonical)
                 edges.append({
                     "source_id":      file_id,
                     "target_id":      registry[resolved],
-                    "weight":         1.0,
+                    "weight":         edge_weight,
+                    "edge_type":      edge_type,
                     "binding":        binding or (next(iter(all_names_for_imp), "") if all_names_for_imp else ""),
                     "called_names":   called_names,
                     "is_dead_import": not is_live and not called_names,

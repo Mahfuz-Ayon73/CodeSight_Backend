@@ -94,6 +94,7 @@ def inject_naming_convention_edges(
                 "source_id":    src_id,
                 "target_id":    tgt_id,
                 "weight":       0.4,
+                "edge_type":    "BELONGS_TO_DOMAIN",
                 "binding":      "",
                 "called_names": list(shared),
                 "is_dead_import":  False,
