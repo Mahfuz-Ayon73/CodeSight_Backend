@@ -7,12 +7,15 @@ import com.codesight.codesight.app.project.model.AnalysisStatus;
 import com.codesight.codesight.app.project.model.ProjectMemberModel;
 import com.codesight.codesight.app.project.model.ProjectMemberRole;
 import com.codesight.codesight.app.project.model.ProjectModel;
+import com.codesight.codesight.app.project.model.ProjectSourceType;
 import com.codesight.codesight.app.project.repository.ProjectMemberRepository;
 import com.codesight.codesight.app.project.repository.ProjectRepository;
+import com.codesight.codesight.common.exception.BadRequestException;
 import com.codesight.codesight.common.exception.ResourceNotFoundException;
 import com.codesight.codesight.common.exception.UnauthorizedException;
 import com.codesight.codesight.common.utils.ObjectToDTOMapper;
 import lombok.RequiredArgsConstructor;
+import lombok.extern.slf4j.Slf4j;
 import org.springframework.stereotype.Service;
 import org.springframework.transaction.annotation.Transactional;
 
@@ -22,6 +25,7 @@ import java.util.stream.Collectors;
 
 @Service
 @RequiredArgsConstructor
+@Slf4j
 public class ProjectService {
 
     private final ProjectRepository projectRepository;
@@ -32,15 +36,28 @@ public class ProjectService {
     public ProjectResponseDto createProject(UUID organizationId, ProjectRequestDto request, UUID ownerId) {
         organizationAccessService.requireMembership(organizationId, ownerId);
 
+        ProjectSourceType sourceType = request.getSourceType() != null
+                ? request.getSourceType()
+                : ProjectSourceType.LOCAL_ZIP;
+
+        if (sourceType == ProjectSourceType.GITHUB
+                && (request.getGithubUrl() == null || request.getGithubUrl().isBlank())) {
+            throw new BadRequestException("githubUrl is required when sourceType is GITHUB");
+        }
+
         ProjectModel project = ProjectModel.builder()
                 .name(request.getName().trim())
                 .description(request.getDescription())
                 .organizationId(organizationId)
                 .ownerId(ownerId)
+                .sourceType(sourceType)
+                .githubUrl(sourceType == ProjectSourceType.GITHUB ? request.getGithubUrl() : null)
                 .analysisStatus(AnalysisStatus.PENDING_UPLOAD)
                 .build();
 
         ProjectModel saved = projectRepository.save(project);
+        log.info("[PROJECT-CREATE] org={} project={} owner={} sourceType={} githubUrl={}",
+                organizationId, saved.getId(), ownerId, sourceType, saved.getGithubUrl());
 
         // Auto-enroll the creator as OWNER in project_members
         projectMemberRepository.save(ProjectMemberModel.builder()

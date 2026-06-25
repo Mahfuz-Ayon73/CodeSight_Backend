@@ -1,5 +1,6 @@
 package com.codesight.codesight.app.project.dto;
 
+import com.codesight.codesight.app.project.model.ProjectSourceType;
 import jakarta.validation.constraints.NotBlank;
 import jakarta.validation.constraints.Size;
 import lombok.AllArgsConstructor;
@@ -19,4 +20,10 @@ public class ProjectRequestDto {
 
     @Size(max = 500)
     private String description;
+
+    /** Optional. Defaults to LOCAL_ZIP when omitted. */
+    private ProjectSourceType sourceType;
+
+    /** Required when sourceType == GITHUB. */
+    private String githubUrl;
 }
