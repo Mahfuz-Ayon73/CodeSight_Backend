@@ -101,6 +101,7 @@ def build_blueprint(
                 "binding":        data.get("binding", ""),
                 "called_names":   data.get("called_names", []),
                 "is_dead_import": data.get("is_dead_import", False),
+                "is_synthetic":   data.get("is_synthetic", False),
             })
 
     # Build flat clusters array — no embedded node objects, only metadata

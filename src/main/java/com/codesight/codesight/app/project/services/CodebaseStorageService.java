@@ -28,9 +28,14 @@ public class CodebaseStorageService {
             try (Stream<Path> paths = Files.walk(repoPath)) {
                 paths.sorted(Comparator.reverseOrder()).forEach(path -> {
                     try {
+                        Files.setAttribute(path, "dos:readonly", false);
+                    } catch (UnsupportedOperationException | IOException ignored) {
+                        // not a DOS-attribute filesystem, or attribute already gone
+                    }
+                    try {
                         Files.deleteIfExists(path);
                     } catch (IOException e) {
-                        throw new RuntimeException("Failed to clear repository directory", e);
+                        throw new RuntimeException("Failed to clear repository directory at " + path + ": " + e.getMessage(), e);
                     }
                 });
             }

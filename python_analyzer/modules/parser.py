@@ -16,9 +16,13 @@ import numpy as np
 
 from modules.treesitter_setup import _TS_AVAILABLE
 from modules.extractors import extract_imports, extract_exports, extract_callsites, extract_ref_usages
-from modules.import_resolver import load_path_aliases, resolve_import, get_import_bindings, get_all_named_bindings
+from modules.import_resolver import (
+    load_path_aliases, load_workspace_packages, resolve_import,
+    get_import_bindings, get_all_named_bindings,
+)
 from modules.embeddings import preprocess_text, generate_embeddings
 from modules.naming_conventions import inject_naming_convention_edges
+from modules.routing_conventions import inject_routing_convention_edges
 
 
 # ---------------------------------------------------------------------------
@@ -142,8 +146,9 @@ def parse_codebase(
         edges      — list of {source_id, target_id, weight, ...} for internal deps
         embeddings — (N, 384) float32 numpy array, one row per node
     """
-    aliases        = load_path_aliases(repo_root)
-    repo_root_path = Path(repo_root).resolve()
+    aliases            = load_path_aliases(repo_root)
+    workspace_packages = load_workspace_packages(repo_root)
+    repo_root_path     = Path(repo_root).resolve()
 
     nodes:      list[dict] = []
     edges:      list[dict] = []
@@ -206,7 +211,7 @@ def parse_codebase(
         external_deps:    list[str] = []
 
         for imp in raw_imports:
-            resolved = resolve_import(imp, canonical, repo_root, registry, aliases)
+            resolved = resolve_import(imp, canonical, repo_root, registry, aliases, workspace_packages)
             if resolved:
                 internal_targets.append(resolved)
 
@@ -256,8 +261,9 @@ def parse_codebase(
         print(f"[Parser] Detected {dead_count} dead import(s) across {len(edges)} edges.")
 
     # ------------------------------------------------------------------
-    # Synthetic naming-convention edges
+    # Synthetic naming-convention + routing-convention edges
     # ------------------------------------------------------------------
     edges = inject_naming_convention_edges(edges, nodes, registry)
+    edges = inject_routing_convention_edges(edges, nodes, registry)
 
     return nodes, edges, embeddings

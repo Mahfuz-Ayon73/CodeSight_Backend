@@ -129,6 +129,8 @@ public class ProjectUploadService {
             githubCloneService.cloneRepository(normalizedUrl, repoPath, accessToken);
             markUploadSuccess(project, ProjectSourceType.GITHUB, normalizedUrl, repoPath);
         } catch (Exception ex) {
+            log.error("[GITHUB] Upload failed — org={} project={} url={}: {}",
+                    organizationId, projectId, normalizedUrl, ex.getMessage(), ex);
             markUploadFailure(project, ex.getMessage());
             projectRepository.save(project);
             if (ex instanceof IOException ioEx) throw ioEx;

@@ -223,11 +223,12 @@ def _is_structural_edge(data: dict) -> bool:
     """
     Return True if this edge should participate in community detection.
 
-    Only "BELONGS_TO_DOMAIN" edges (weight > 0) count. "RENDERS" edges
-    are preserved on the graph but stripped here so shared UI imports
-    don't collapse all pages into one mega-cluster.
+    Only "BELONGS_TO_DOMAIN" edges (weight > 0) count. "RENDERS" and
+    "SEMANTIC_SIMILARITY" edges are preserved on the graph but stripped here
+    so shared UI imports / explanatory placement edges don't influence
+    community detection.
     """
-    if data.get("edge_type") == "RENDERS":
+    if data.get("edge_type") in ("RENDERS", "SEMANTIC_SIMILARITY"):
         return False
     return float(data.get("weight", 1.0)) > 0.0
 
@@ -300,6 +301,108 @@ def _fallback_connected_components(G: nx.DiGraph) -> dict[int, int]:
 
 
 # ---------------------------------------------------------------------------
+# Embedding-based fallback helpers
+#
+# Used when a node/bucket has no structural-edge neighbour to attach to.
+# `embeddings` rows are indexed directly by node id — ids are contiguous
+# 0..N-1 by construction in parser.py, so no separate id->row map is needed
+# (a prior version of this code maintained one, but it mapped ids into
+# positions within the admin-filtered node list rather than embedding rows,
+# which silently misindexed `embeddings` whenever admin files existed).
+# ---------------------------------------------------------------------------
+
+def _centroid_of(node_ids: list[int], embeddings: np.ndarray) -> np.ndarray | None:
+    idxs = [n for n in node_ids if 0 <= n < len(embeddings)]
+    if not idxs:
+        return None
+    return embeddings[idxs].mean(axis=0)
+
+
+def _cosine_sim(a: np.ndarray, b: np.ndarray) -> float:
+    denom = np.linalg.norm(a) * np.linalg.norm(b)
+    return float(np.dot(a, b) / denom) if denom > 0 else 0.0
+
+
+def _best_match_by_centroid(
+    query_vec: np.ndarray,
+    candidates: dict[str, np.ndarray],
+) -> tuple[str | None, float]:
+    best_key, best_sim = None, -1.0
+    for key, vec in candidates.items():
+        sim = _cosine_sim(query_vec, vec)
+        if sim > best_sim:
+            best_sim, best_key = sim, key
+    return best_key, best_sim
+
+
+def _compute_cluster_centroids(clusters: list[dict], embeddings: np.ndarray) -> dict[str, np.ndarray]:
+    centroids: dict[str, np.ndarray] = {}
+    for c in clusters:
+        centroid = _centroid_of(c["node_ids"], embeddings)
+        if centroid is not None:
+            centroids[c["id"]] = centroid
+    return centroids
+
+
+def _nearest_cluster_by_centroid(
+    node_id: int,
+    centroids: dict[str, np.ndarray],
+    embeddings: np.ndarray,
+) -> tuple[str | None, float]:
+    if not centroids or node_id >= len(embeddings):
+        return None, -1.0
+    return _best_match_by_centroid(embeddings[node_id], centroids)
+
+
+def _nearest_member_by_embedding(
+    node_id: int,
+    member_ids: list[int],
+    embeddings: np.ndarray,
+) -> int | None:
+    """Pick the single member of `member_ids` most similar to node_id by cosine."""
+    if node_id >= len(embeddings):
+        return None
+    candidates = {
+        mid: embeddings[mid] for mid in member_ids
+        if mid != node_id and mid < len(embeddings)
+    }
+    best_id, _ = _best_match_by_centroid(embeddings[node_id], candidates)
+    return best_id
+
+
+def _closest_by_directory_prefix(sk: str, buckets: dict[str, list[int]]) -> str | None:
+    best, best_common = None, -1
+    sk_parts = sk.split("/")
+    for ok in buckets:
+        if ok == sk:
+            continue
+        ok_parts = ok.split("/")
+        common = sum(1 for a, b in zip(sk_parts, ok_parts) if a == b)
+        if common > best_common:
+            best_common, best = common, ok
+    return best
+
+
+def _add_semantic_edge(G: nx.DiGraph, src: int, tgt: int, weight: float = 0.2) -> None:
+    """
+    Inject a visible, low-weight explanatory edge for a node placed by
+    embedding similarity rather than a real structural connection — keeps
+    placements out of the frontend's "orphan" / analytics' "0 intra-cluster
+    edges" bucket instead of leaving them silently floating in their cluster.
+    """
+    if G.has_edge(src, tgt):
+        return
+    G.add_edge(src, tgt,
+        weight=weight,
+        edge_type="SEMANTIC_SIMILARITY",
+        binding="",
+        called_names=[],
+        is_dead_import=False,
+        is_synthetic=True,
+    )
+
+
+# ---------------------------------------------------------------------------
 # Pass 1 — Directory-seeded merge (bottom-up grouping)
 # ---------------------------------------------------------------------------
 
@@ -363,12 +466,16 @@ def _merge_small_buckets(
     buckets: dict[str, list[int]],
     G: nx.DiGraph,
     min_size: int,
+    embeddings: np.ndarray | None = None,
+    semantic_graph: nx.DiGraph | None = None,
 ) -> dict[str, list[int]]:
     """
     Iteratively absorb buckets smaller than min_size into the neighbour
     bucket with the highest inter-bucket edge weight.
-    Buckets with no edge neighbours get merged with the closest bucket
-    by directory prefix similarity.
+    Buckets with no edge neighbours fall back to embedding-centroid
+    similarity (when available — `semantic_graph` then gets a visible
+    explanatory edge for the merged-in files), else directory prefix
+    similarity as a last resort.
     """
     # Build inter-bucket edge weight matrix
     node_to_bucket = {nid: k for k, nodes in buckets.items() for nid in nodes}
@@ -407,18 +514,26 @@ def _merge_small_buckets(
 
             if neighbor_w:
                 best = max(neighbor_w, key=neighbor_w.get)
-            else:
-                # No edge neighbours — merge with most similar directory prefix
+            elif embeddings is not None:
+                sk_centroid = _centroid_of(buckets[sk], embeddings)
+                other_centroids = {
+                    ok: c for ok, ids in buckets.items() if ok != sk
+                    for c in [_centroid_of(ids, embeddings)] if c is not None
+                }
                 best = None
-                best_common = -1
-                sk_parts = sk.split("/")
-                for ok in buckets:
-                    if ok == sk:
-                        continue
-                    ok_parts = ok.split("/")
-                    common = sum(1 for a, b in zip(sk_parts, ok_parts) if a == b)
-                    if common > best_common:
-                        best_common, best = common, ok
+                if sk_centroid is not None:
+                    best, _ = _best_match_by_centroid(sk_centroid, other_centroids)
+                if best is None:
+                    best = _closest_by_directory_prefix(sk, buckets)
+                elif best in buckets:
+                    sg = semantic_graph if semantic_graph is not None else G
+                    for nid in buckets[sk]:
+                        member = _nearest_member_by_embedding(nid, buckets[best], embeddings)
+                        if member is not None:
+                            _add_semantic_edge(sg, nid, member)
+            else:
+                # No edge neighbours, no embeddings — merge with most similar directory prefix
+                best = _closest_by_directory_prefix(sk, buckets)
 
             if best and best in buckets:
                 buckets[best].extend(buckets[sk])
@@ -520,8 +635,6 @@ def cluster_codebase(
     all_paths = [n["canonical_path"] for n in nodes]
     _LAYER_WORDS = build_layer_word_set(all_paths)
 
-    node_id_to_index = {node["id"]: i for i, node in enumerate(nodes)}
-
     # Build graph
     G = build_graph(nodes, edges)
     _assign_global_roles(G)
@@ -537,7 +650,10 @@ def cluster_codebase(
     raw_buckets = _directory_seed_groups(G_pruned)
     print(f"[Clustering] Pass 1: {len(raw_buckets)} directory buckets from {len(G_pruned)} nodes.")
 
-    merged_buckets = _merge_small_buckets(raw_buckets, G_pruned, min_size=MIN_CLUSTER_SIZE)
+    merged_buckets = _merge_small_buckets(
+        raw_buckets, G_pruned, min_size=MIN_CLUSTER_SIZE,
+        embeddings=embeddings, semantic_graph=G,
+    )
     print(f"[Clustering] Pass 1 after merge: {len(merged_buckets)} buckets.")
 
     # ------------------------------------------------------------------
@@ -562,25 +678,16 @@ def cluster_codebase(
     leaf_clusters = [c for c in all_clusters if not c.get("_is_intermediate")]
 
     if pruned_ids and embeddings is not None:
-        centroids: dict[str, np.ndarray] = {}
-        for c in leaf_clusters:
-            idxs = [node_id_to_index[m] for m in c["node_ids"] if m in node_id_to_index]
-            if idxs:
-                centroids[c["id"]] = embeddings[idxs].mean(axis=0)
+        centroids = _compute_cluster_centroids(leaf_clusters, embeddings)
         for orch_id in pruned_ids:
-            if orch_id not in node_id_to_index:
-                continue
-            orch_emb = embeddings[node_id_to_index[orch_id]]
-            best_cid, best_sim = None, -1.0
-            for cid_key, centroid in centroids.items():
-                denom = np.linalg.norm(orch_emb) * np.linalg.norm(centroid)
-                sim = float(np.dot(orch_emb, centroid) / denom) if denom > 0 else 0.0
-                if sim > best_sim:
-                    best_sim, best_cid = sim, cid_key
+            best_cid, _ = _nearest_cluster_by_centroid(orch_id, centroids, embeddings)
             if best_cid:
                 for c in leaf_clusters:
                     if c["id"] == best_cid:
                         c["node_ids"].append(orch_id)
+                        member = _nearest_member_by_embedding(orch_id, c["node_ids"], embeddings)
+                        if member is not None:
+                            _add_semantic_edge(G, orch_id, member)
                         break
             else:
                 cid = f"c_{cluster_counter[0]:04d}"
@@ -598,6 +705,14 @@ def cluster_codebase(
     multi_ids  = {c["id"] for c in leaf_clusters if len(c["node_ids"]) > 1}
     id_to_leaf = {c["id"]: c for c in leaf_clusters}
 
+    # Snapshot of multi-node centroids for the embedding fallback below —
+    # computed once up front; newly-promoted singletons aren't reflected in
+    # it, which is an acceptable simplification for a fallback safety net.
+    multi_centroids = (
+        _compute_cluster_centroids([id_to_leaf[cid] for cid in multi_ids], embeddings)
+        if embeddings is not None else {}
+    )
+
     for c in [c for c in leaf_clusters if len(c["node_ids"]) == 1]:
         nid = c["node_ids"][0]
         neighbor_w: dict[str, float] = defaultdict(float)
@@ -614,11 +729,22 @@ def cluster_codebase(
             sc = node_to_cluster.get(src)
             if sc and sc != c["id"] and sc in multi_ids:
                 neighbor_w[sc] += float(edata.get("weight", 1.0))
+
         if neighbor_w:
             best = max(neighbor_w, key=neighbor_w.get)
+        elif multi_centroids:
+            best, _ = _nearest_cluster_by_centroid(nid, multi_centroids, embeddings)
+        else:
+            best = None
+
+        if best:
             id_to_leaf[best]["node_ids"].append(nid)
             node_to_cluster[nid] = best
             multi_ids.add(best)
+            if not neighbor_w:
+                member = _nearest_member_by_embedding(nid, id_to_leaf[best]["node_ids"], embeddings)
+                if member is not None:
+                    _add_semantic_edge(G, nid, member)
             c["node_ids"] = []
 
     leaf_clusters = [c for c in leaf_clusters if c["node_ids"]]

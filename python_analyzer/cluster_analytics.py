@@ -8,7 +8,7 @@ Called automatically after analysis completes, or manually:
 
 import json
 import sys
-from collections import Counter
+from collections import Counter, defaultdict
 from pathlib import Path
 
 
@@ -106,8 +106,8 @@ def generate(blueprint_path: str) -> str:
             canonical = node.get("canonical_path", "")
             fname = Path(canonical).name if canonical else str(nid)
 
-            internal_out = [(t, e["weight"]) for e in edges if e["source"] == nid and e["target"] in node_set]
-            internal_in  = [(s, e["weight"]) for e in edges if e["target"] == nid and e["source"] in node_set]
+            internal_out = [(e["target"], e["weight"]) for e in edges if e["source"] == nid and e["target"] in node_set]
+            internal_in  = [(e["source"], e["weight"]) for e in edges if e["target"] == nid and e["source"] in node_set]
             total_internal = len(internal_out) + len(internal_in)
 
             if total_internal == 0:
