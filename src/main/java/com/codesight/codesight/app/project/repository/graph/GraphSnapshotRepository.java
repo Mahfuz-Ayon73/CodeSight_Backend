@@ -18,6 +18,8 @@ public interface GraphSnapshotRepository extends JpaRepository<GraphSnapshot, UU
 
     List<GraphSnapshot> findByProjectIdOrderByAnalyzedAtDesc(UUID projectId);
 
+    Optional<GraphSnapshot> findByProjectIdAndCommitSha(UUID projectId, String commitSha);
+
     /** Latest snapshot per project — used by "My Workspace" bootstrap. */
     Optional<GraphSnapshot> findFirstByProjectIdOrderByAnalyzedAtDesc(UUID projectId);
 

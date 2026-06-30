@@ -2,6 +2,8 @@ package com.codesight.codesight.app.project.model;
 
 import jakarta.persistence.*;
 import lombok.*;
+import org.hibernate.annotations.JdbcTypeCode;
+import org.hibernate.type.SqlTypes;
 
 import java.time.LocalDateTime;
 import java.util.UUID;
@@ -46,6 +48,12 @@ public class ProjectModel {
 
     @Column(length = 2048)
     private String uploadErrorMessage;
+
+    /** Canvas-level cluster merge overrides stored as JSON array of ClusterMerge objects. */
+    @JdbcTypeCode(SqlTypes.JSON)
+    @Column(name = "user_merges_json", columnDefinition = "jsonb")
+    @Builder.Default
+    private String userMergesJson = "[]";
 
     private LocalDateTime uploadedAt;
     private LocalDateTime analysisCompletedAt;
