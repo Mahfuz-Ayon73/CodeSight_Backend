@@ -1,9 +1,11 @@
 package com.codesight.codesight.app.project.controllers;
 import com.codesight.codesight.app.project.dto.BlueprintDto;
 import com.codesight.codesight.app.project.dto.GithubUploadRequestDto;
+import com.codesight.codesight.app.project.dto.GithubUploadStartedDto;
 import com.codesight.codesight.app.project.dto.ProjectRequestDto;
 import com.codesight.codesight.app.project.dto.ProjectResponseDto;
 import com.codesight.codesight.app.project.services.ChunkedUploadService;
+import com.codesight.codesight.app.project.services.CloneProgressStore;
 import com.codesight.codesight.app.project.services.ProjectAnalysisBlueprintService;
 import com.codesight.codesight.app.project.services.ProjectService;
 import com.codesight.codesight.app.project.services.ProjectUploadService;
@@ -103,20 +105,37 @@ public class ProjectController {
     }
 
     @PostMapping("/{projectId}/upload/github")
-    public ResponseEntity<ProjectResponseDto> uploadGithub(
+    public ResponseEntity<GithubUploadStartedDto> uploadGithub(
             @PathVariable UUID organizationId,
             @PathVariable UUID projectId,
             @Valid @RequestBody GithubUploadRequestDto request,
             @AuthenticationPrincipal UserModel currentUser
-    ) throws IOException {
+    ) {
+        log.info("[CONTROLLER] GitHub upload queued — org={} project={}", organizationId, projectId);
+        projectUploadService.startGithubUpload(
+                organizationId,
+                projectId,
+                currentUser.getId(),
+                request.getGithubUrl(),
+                request.getAccessToken()
+        );
+        return ResponseEntity.status(HttpStatus.ACCEPTED).body(
+                GithubUploadStartedDto.builder()
+                        .projectId(projectId)
+                        .status("cloning")
+                        .message("Clone queued")
+                        .build()
+        );
+    }
+
+    @GetMapping("/{projectId}/upload/clone-status")
+    public ResponseEntity<CloneProgressStore.CloneProgress> getCloneStatus(
+            @PathVariable UUID organizationId,
+            @PathVariable UUID projectId,
+            @AuthenticationPrincipal UserModel currentUser
+    ) {
         return ResponseEntity.ok(
-                projectUploadService.uploadFromGithub(
-                        organizationId,
-                        projectId,
-                        currentUser.getId(),
-                        request.getGithubUrl(),
-                        request.getAccessToken()
-                )
+                projectUploadService.getCloneProgress(organizationId, projectId, currentUser.getId())
         );
     }
 

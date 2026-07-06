@@ -3,6 +3,7 @@ package com.codesight.codesight.app.project.services;
 import com.codesight.codesight.common.exception.BadRequestException;
 import org.eclipse.jgit.api.Git;
 import org.eclipse.jgit.api.errors.TransportException;
+import org.eclipse.jgit.lib.ProgressMonitor;
 import org.eclipse.jgit.transport.UsernamePasswordCredentialsProvider;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
@@ -43,12 +44,26 @@ public class GithubCloneService {
      * For public repos, pass null.
      */
     public void cloneRepository(String githubUrl, Path destination, String accessToken) {
+        cloneRepository(githubUrl, destination, accessToken, null);
+    }
+
+    /**
+     * Clone a repository, reporting live progress via the given monitor.
+     * Uses a depth-1 (shallow) clone — analysis only needs the current file
+     * tree, not full commit history, which is what made large/old repos slow.
+     */
+    public void cloneRepository(String githubUrl, Path destination, String accessToken, ProgressMonitor progressMonitor) {
         String normalizedUrl = normalizeGithubUrl(githubUrl);
         try {
             var cloneCommand = Git.cloneRepository()
                     .setURI(normalizedUrl)
                     .setDirectory(destination.toFile())
-                    .setCloneAllBranches(false);
+                    .setCloneAllBranches(false)
+                    .setDepth(1);
+
+            if (progressMonitor != null) {
+                cloneCommand.setProgressMonitor(progressMonitor);
+            }
 
             if (accessToken != null && !accessToken.isBlank()) {
                 // GitHub PATs: use "x-access-token" as username, token as password

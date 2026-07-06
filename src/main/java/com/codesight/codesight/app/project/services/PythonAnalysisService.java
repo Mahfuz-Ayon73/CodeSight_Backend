@@ -2,6 +2,7 @@ package com.codesight.codesight.app.project.services;
 
 import com.codesight.codesight.app.project.dto.AnalysisRequestDto;
 import com.codesight.codesight.app.project.dto.AnalysisResponseDto;
+import com.codesight.codesight.app.project.dto.AnalysisStatusResponseDto;
 import com.codesight.codesight.app.project.model.AnalysisStatus;
 import com.codesight.codesight.app.project.model.ProjectModel;
 import com.codesight.codesight.app.project.repository.ProjectRepository;
@@ -28,12 +29,17 @@ public class PythonAnalysisService {
 
     private final ProjectRepository projectRepository;
     private final RestTemplate restTemplate;
+    private final AnalysisProgressStore analysisProgressStore;
 
     @Value("${codesight.python-analyzer.base-url:http://localhost:8000}")
     private String pythonAnalyzerBaseUrl;
 
     @Value("${codesight.analysis.output-dir:/tmp/codesight-analysis}")
     private String analysisOutputDir;
+
+    private static final long POLL_INTERVAL_MS = 2000;
+    private static final int MAX_POLL_ATTEMPTS = 900; // ~30 minutes at 2s/poll
+    private static final int MAX_CONSECUTIVE_POLL_ERRORS = 5;
 
     /**
      * Trigger analysis asynchronously after a successful codebase upload.
@@ -63,33 +69,23 @@ public class PythonAnalysisService {
             request.setOutputDir(outputDir.toString());
             request.setPurgeSource(false); // Keep source files for now
             
-            // Call Python FastAPI service
+            // Call Python FastAPI service — this only queues the job and returns
+            // immediately; it does NOT mean the analysis has finished.
             AnalysisResponseDto response = callPythonAnalyzer(request);
-            
+
             if (response.getSuccess() != null && response.getSuccess()) {
-                // Analysis succeeded — update status and store blueprint path
-                ProjectModel project = updateProjectAnalysisStatus(
-                    organizationId, 
-                    projectId, 
-                    AnalysisStatus.COMPLETED, 
-                    null
-                );
-                
-                // Store the blueprint path in the project (you might want to add this field)
-                project.setAnalysisCompletedAt(LocalDateTime.now());
-                // project.setBlueprintPath(response.getBlueprintPath()); // Add this field if needed
-                projectRepository.save(project);
-                
-                log.info("Analysis completed successfully for project {}: {}", projectId, response.getBlueprintPath());
+                // Queued successfully — poll Python's real task status until it
+                // actually finishes (or fails/times out) before marking COMPLETED.
+                pollUntilAnalysisFinishes(organizationId, projectId);
             } else {
-                // Analysis failed
-                String errorMsg = response.getErrorMessage() != null 
-                    ? response.getErrorMessage() 
+                // Failed to even queue the analysis
+                String errorMsg = response.getErrorMessage() != null
+                    ? response.getErrorMessage()
                     : "Unknown analysis error";
                 updateProjectAnalysisStatus(organizationId, projectId, AnalysisStatus.FAILED, errorMsg);
                 log.error("Analysis failed for project {}: {}", projectId, errorMsg);
             }
-            
+
         } catch (Exception e) {
             log.error("Analysis failed for project {} with exception", projectId, e);
             updateProjectAnalysisStatus(
@@ -154,15 +150,69 @@ public class PythonAnalysisService {
     }
 
     /**
-     * Get analysis status for a project from the Python service.
+     * Poll Python's real task status until the analysis completes, fails, or times out,
+     * mirroring live stage/message into AnalysisProgressStore and only writing the terminal
+     * status to the DB once Python actually reports it.
      */
-    public String getAnalysisStatus(UUID projectId) {
+    private void pollUntilAnalysisFinishes(UUID organizationId, UUID projectId) throws InterruptedException {
+        String progressKey = projectId.toString();
+        int consecutiveErrors = 0;
+
+        for (int attempt = 0; attempt < MAX_POLL_ATTEMPTS; attempt++) {
+            Thread.sleep(POLL_INTERVAL_MS);
+
+            AnalysisStatusResponseDto status = fetchAnalysisStatus(projectId);
+            if (status == null) {
+                consecutiveErrors++;
+                if (consecutiveErrors >= MAX_CONSECUTIVE_POLL_ERRORS) {
+                    updateProjectAnalysisStatus(
+                        organizationId, projectId, AnalysisStatus.FAILED,
+                        "Lost contact with the analysis service"
+                    );
+                    analysisProgressStore.remove(progressKey);
+                    return;
+                }
+                continue;
+            }
+            consecutiveErrors = 0;
+            analysisProgressStore.update(progressKey, status.getStage(), status.getMessage());
+
+            if ("completed".equalsIgnoreCase(status.getStatus())) {
+                ProjectModel project = updateProjectAnalysisStatus(
+                    organizationId, projectId, AnalysisStatus.COMPLETED, null
+                );
+                project.setAnalysisCompletedAt(LocalDateTime.now());
+                projectRepository.save(project);
+                analysisProgressStore.remove(progressKey);
+                log.info("Analysis completed successfully for project {}: {}", projectId, status.getBlueprintPath());
+                return;
+            }
+
+            if ("failed".equalsIgnoreCase(status.getStatus())) {
+                String errorMsg = status.getErrorMessage() != null
+                    ? status.getErrorMessage()
+                    : "Unknown analysis error";
+                updateProjectAnalysisStatus(organizationId, projectId, AnalysisStatus.FAILED, errorMsg);
+                analysisProgressStore.remove(progressKey);
+                log.error("Analysis failed for project {}: {}", projectId, errorMsg);
+                return;
+            }
+            // "queued" / "running" — keep polling
+        }
+
+        updateProjectAnalysisStatus(organizationId, projectId, AnalysisStatus.FAILED, "Analysis timed out");
+        analysisProgressStore.remove(progressKey);
+        log.error("Analysis timed out for project {}", projectId);
+    }
+
+    private AnalysisStatusResponseDto fetchAnalysisStatus(UUID projectId) {
         try {
             String url = pythonAnalyzerBaseUrl + "/analyze/" + projectId + "/status";
-            ResponseEntity<String> response = restTemplate.getForEntity(url, String.class);
+            ResponseEntity<AnalysisStatusResponseDto> response =
+                restTemplate.getForEntity(url, AnalysisStatusResponseDto.class);
             return response.getBody();
         } catch (Exception e) {
-            log.warn("Failed to get analysis status for project {}: {}", projectId, e.getMessage());
+            log.warn("Failed to poll analysis status for project {}: {}", projectId, e.getMessage());
             return null;
         }
     }

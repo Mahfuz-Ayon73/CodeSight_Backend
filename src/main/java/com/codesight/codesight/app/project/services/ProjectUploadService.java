@@ -10,6 +10,7 @@ import com.codesight.codesight.common.exception.ResourceNotFoundException;
 import com.codesight.codesight.common.utils.ObjectToDTOMapper;
 import lombok.RequiredArgsConstructor;
 import lombok.extern.slf4j.Slf4j;
+import org.springframework.scheduling.annotation.Async;
 import org.springframework.stereotype.Service;
 import org.springframework.transaction.annotation.Transactional;
 import org.springframework.web.multipart.MultipartFile;
@@ -32,6 +33,7 @@ public class ProjectUploadService {
     private final FolderUploadService folderUploadService;
     private final GithubCloneService githubCloneService;
     private final PythonAnalysisService pythonAnalysisService;
+    private final CloneProgressStore cloneProgressStore;
 
     @Transactional
     public ProjectResponseDto uploadZip(
@@ -102,42 +104,60 @@ public class ProjectUploadService {
         return ObjectToDTOMapper.toProjectResponseDto(projectRepository.save(project));
     }
 
-    @Transactional
-    public ProjectResponseDto uploadFromGithub(
-            UUID organizationId,
-            UUID projectId,
-            UUID userId,
-            String githubUrl
-    ) throws IOException {
-        return uploadFromGithub(organizationId, projectId, userId, githubUrl, null);
-    }
-
-    @Transactional
-    public ProjectResponseDto uploadFromGithub(
+    /**
+     * Kick off a GitHub clone in the background and return immediately. Progress is
+     * reported into CloneProgressStore (see GitCloneProgressMonitor) and polled by the
+     * client via getCloneProgress. Runs on its own thread (@Async) rather than inside
+     * one long DB transaction, since a large clone can take minutes and shouldn't hold
+     * a DB connection open the whole time.
+     */
+    @Async
+    public void startGithubUpload(
             UUID organizationId,
             UUID projectId,
             UUID userId,
             String githubUrl,
             String accessToken
-    ) throws IOException {
-        ProjectModel project = loadProjectForUpload(organizationId, projectId, userId);
-        String normalizedUrl = githubCloneService.normalizeGithubUrl(githubUrl);
+    ) {
+        String progressKey = projectId.toString();
+        cloneProgressStore.update(progressKey, "connecting", 0, "Connecting to GitHub...");
+
+        ProjectModel project;
+        String normalizedUrl;
+        try {
+            project = loadProjectForUpload(organizationId, projectId, userId);
+            normalizedUrl = githubCloneService.normalizeGithubUrl(githubUrl);
+        } catch (Exception ex) {
+            log.error("[GITHUB] Upload could not start — org={} project={}: {}",
+                    organizationId, projectId, ex.getMessage(), ex);
+            cloneProgressStore.update(progressKey, "failed", 0, ex.getMessage());
+            return;
+        }
+
         Path repoPath = codebaseStorageService.resolveProjectRepoPath(organizationId, projectId);
 
         try {
+            cloneProgressStore.update(progressKey, "preparing", 0, "Preparing directory...");
             codebaseStorageService.prepareRepoDirectory(repoPath);
-            githubCloneService.cloneRepository(normalizedUrl, repoPath, accessToken);
+
+            GitCloneProgressMonitor monitor = new GitCloneProgressMonitor(cloneProgressStore, progressKey);
+            githubCloneService.cloneRepository(normalizedUrl, repoPath, accessToken, monitor);
+
             markUploadSuccess(project, ProjectSourceType.GITHUB, normalizedUrl, repoPath);
+            projectRepository.save(project);
+            cloneProgressStore.update(progressKey, "done", 100, "Clone complete");
         } catch (Exception ex) {
             log.error("[GITHUB] Upload failed — org={} project={} url={}: {}",
                     organizationId, projectId, normalizedUrl, ex.getMessage(), ex);
             markUploadFailure(project, ex.getMessage());
             projectRepository.save(project);
-            if (ex instanceof IOException ioEx) throw ioEx;
-            throw new RuntimeException(ex.getMessage(), ex);
+            cloneProgressStore.update(progressKey, "failed", 0, ex.getMessage());
         }
+    }
 
-        return ObjectToDTOMapper.toProjectResponseDto(projectRepository.save(project));
+    public CloneProgressStore.CloneProgress getCloneProgress(UUID organizationId, UUID projectId, UUID userId) {
+        organizationAccessService.requireMembership(organizationId, userId);
+        return cloneProgressStore.get(projectId.toString());
     }
 
     public String getStoragePath(UUID organizationId, UUID projectId, UUID userId) {

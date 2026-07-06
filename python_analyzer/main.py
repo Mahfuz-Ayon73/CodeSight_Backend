@@ -4,6 +4,7 @@ Provides REST endpoints for Spring Boot backend to trigger codebase analysis.
 """
 
 import asyncio
+import functools
 import os
 import tempfile
 import uuid
@@ -111,6 +112,8 @@ async def trigger_analysis(
     analysis_tasks[task_id] = {
         "project_id": request.project_id,
         "status": "queued",
+        "stage": "queued",
+        "message": "Waiting to start...",
         "repo_path": str(repo_path),
         "output_dir": str(output_dir),
         "purge_source": request.purge_source,
@@ -152,6 +155,8 @@ async def get_analysis_status(project_id: str):
         "task_id": task_id,
         "project_id": project_id,
         "status": task_info["status"],
+        "stage": task_info.get("stage"),
+        "message": task_info.get("message"),
         "blueprint_path": task_info.get("blueprint_path"),
         "error_message": task_info.get("error_message"),
         "execution_time_seconds": task_info.get("execution_time_seconds"),
@@ -222,37 +227,45 @@ async def _run_analysis_task(
 ):
     """Background task to run the analysis."""
     import time
-    
+
     # Update status
     analysis_tasks[task_id]["status"] = "running"
-    
+
+    def _progress(stage: str, message: str) -> None:
+        analysis_tasks[task_id]["stage"] = stage
+        analysis_tasks[task_id]["message"] = message
+
     try:
         start_time = time.time()
-        
+
         # Run analysis in thread pool to avoid blocking asyncio
         loop = asyncio.get_event_loop()
         blueprint_path = await loop.run_in_executor(
             None,
-            run_analysis,
-            repo_path,
-            output_dir,
-            project_id,
-            purge_source,
+            functools.partial(
+                run_analysis,
+                repo_path,
+                output_dir,
+                project_id,
+                purge_source,
+                _progress,
+            ),
         )
-        
+
         execution_time = round(time.time() - start_time, 2)
-        
+
         # Update task with success
         analysis_tasks[task_id].update({
             "status": "completed",
             "blueprint_path": blueprint_path,
             "execution_time_seconds": execution_time,
         })
-        
+
     except Exception as e:
         # Update task with error
         analysis_tasks[task_id].update({
             "status": "failed",
+            "stage": "failed",
             "error_message": str(e),
         })
 

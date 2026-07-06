@@ -19,6 +19,7 @@ import shutil
 import sys
 import time
 from pathlib import Path
+from typing import Callable, Optional
 
 from modules.ingestion import crawl, save_registry, partition_registry
 from modules.parser import parse_codebase, detect_module_system
@@ -203,11 +204,17 @@ def run_analysis(
     output_dir: str,
     project_id: str = "unknown",
     purge_after: bool = True,
+    progress_callback: Optional[Callable[[str, str], None]] = None,
 ) -> str:
     """
     Run the full analysis pipeline.
     Returns the path to the generated graph_blueprint.json.
     """
+    def _report(stage: str, message: str) -> None:
+        print(f"[{stage}] {message}")
+        if progress_callback:
+            progress_callback(stage, message)
+
     start = time.time()
     output_path = Path(output_dir)
     output_path.mkdir(parents=True, exist_ok=True)
@@ -219,19 +226,19 @@ def run_analysis(
     print(f"{'='*60}\n")
 
     # Phase 1: Ingest + partition admin files
-    print("[Phase 1] Crawling repository...")
+    _report("crawling", "Crawling repository...")
     registry = crawl(repo_root)
     if not registry:
         print("[ERROR] No source files found. Aborting.")
         sys.exit(1)
-    print(f"[Phase 1] Found {len(registry)} source files.")
+    _report("crawling", f"Found {len(registry)} source files")
 
     app_registry, admin_registry = partition_registry(registry)
-    print(f"[Phase 1] App files: {len(app_registry)}, Admin/DevOps files: {len(admin_registry)}")
+    _report("crawling", f"App files: {len(app_registry)}, Admin/DevOps files: {len(admin_registry)}")
     save_registry(registry, str(output_path / "file_registry.json"))
 
     # Phase 2: Parse + embed (parse ALL files for embeddings, but edges only for app files)
-    print("[Phase 2] Parsing AST and generating embeddings...")
+    _report("parsing", "Parsing AST and generating embeddings...")
     nodes, edges, embeddings = parse_codebase(repo_root, registry)
 
     # Split nodes into app vs admin using the partitioned registries
@@ -242,21 +249,22 @@ def run_analysis(
     app_id_set = set(app_registry.values())
     app_edges  = [e for e in edges if e["source_id"] in app_id_set and e["target_id"] in app_id_set]
 
-    print(f"[Phase 2] {len(app_nodes)} app nodes, {len(app_edges)} internal edges, "
-          f"{len(admin_nodes)} admin nodes (bypassed).")
+    _report("parsing", f"{len(app_nodes)} app nodes, {len(app_edges)} internal edges, "
+            f"{len(admin_nodes)} admin nodes (bypassed)")
 
     # Phase 3: Cluster (app nodes only; admin nodes appended as DevOps cluster)
-    print("[Phase 3] Building graph and clustering...")
+    _report("clustering", "Building dependency graph and clustering modules...")
     graph, clusters, execution_flows = cluster_codebase(
         app_nodes, app_edges, embeddings, admin_nodes=admin_nodes
     )
 
     # Phase 4: Label
-    print("[Phase 4] Labeling clusters...")
+    _report("labeling", "Labeling clusters with AI summaries...")
     llm = get_llm_provider()
     clusters = label_clusters(clusters, nodes, llm)
 
     # Build and write blueprint
+    _report("finalizing", "Writing analysis blueprint...")
     blueprint = build_blueprint(
         project_id=project_id,
         repo_root=repo_root,
@@ -274,15 +282,17 @@ def run_analysis(
 
     elapsed = round(time.time() - start, 2)
     print(f"\n[Done] graph_blueprint.json written to {blueprint_path}")
-    print(f"[Done] Analysis completed in {elapsed}s")
+    _report("finalizing", f"Analysis completed in {elapsed}s")
 
     # Generate cluster analytics alongside the blueprint
     generate_analytics(str(blueprint_path))
 
     # Phase 5: Cleanup — purge source files (Transient Lifecycle)
     if purge_after:
-        print("[Phase 5] Purging source files...")
+        _report("cleanup", "Purging temporary source files...")
         purge_source_files(repo_root)
+
+    _report("done", "Analysis complete")
 
     return str(blueprint_path)
 

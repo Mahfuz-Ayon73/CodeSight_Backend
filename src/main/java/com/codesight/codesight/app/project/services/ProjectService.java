@@ -31,6 +31,7 @@ public class ProjectService {
     private final ProjectRepository projectRepository;
     private final ProjectMemberRepository projectMemberRepository;
     private final OrganizationAccessService organizationAccessService;
+    private final AnalysisProgressStore analysisProgressStore;
 
     @Transactional
     public ProjectResponseDto createProject(UUID organizationId, ProjectRequestDto request, UUID ownerId) {
@@ -74,7 +75,15 @@ public class ProjectService {
         organizationAccessService.requireMembership(organizationId, userId);
         ProjectModel project = projectRepository.findByIdAndOrganizationId(projectId, organizationId)
                 .orElseThrow(() -> new ResourceNotFoundException("Project not found"));
-        return ObjectToDTOMapper.toProjectResponseDto(project);
+        ProjectResponseDto dto = ObjectToDTOMapper.toProjectResponseDto(project);
+
+        if (dto.getAnalysisStatus() == AnalysisStatus.IN_PROGRESS) {
+            AnalysisProgressStore.AnalysisProgress progress = analysisProgressStore.get(projectId.toString());
+            dto.setAnalysisStage(progress.stage());
+            dto.setAnalysisMessage(progress.message());
+        }
+
+        return dto;
     }
 
     public List<ProjectResponseDto> listProjects(UUID organizationId, UUID userId) {

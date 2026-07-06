@@ -23,6 +23,8 @@ public class ProjectResponseDto {
     private ProjectSourceType sourceType;
     private String githubUrl;
     private AnalysisStatus analysisStatus;
+    private String analysisStage;
+    private String analysisMessage;
     private String uploadErrorMessage;
     private LocalDateTime uploadedAt;
     private LocalDateTime createdAt;
