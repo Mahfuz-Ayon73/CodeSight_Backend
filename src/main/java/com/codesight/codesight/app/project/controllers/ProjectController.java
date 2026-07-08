@@ -1,11 +1,13 @@
 package com.codesight.codesight.app.project.controllers;
 import com.codesight.codesight.app.project.dto.BlueprintDto;
+import com.codesight.codesight.app.project.dto.FileContentDto;
 import com.codesight.codesight.app.project.dto.GithubUploadRequestDto;
 import com.codesight.codesight.app.project.dto.GithubUploadStartedDto;
 import com.codesight.codesight.app.project.dto.ProjectRequestDto;
 import com.codesight.codesight.app.project.dto.ProjectResponseDto;
 import com.codesight.codesight.app.project.services.ChunkedUploadService;
 import com.codesight.codesight.app.project.services.CloneProgressStore;
+import com.codesight.codesight.app.project.services.FileContentService;
 import com.codesight.codesight.app.project.services.ProjectAnalysisBlueprintService;
 import com.codesight.codesight.app.project.services.ProjectService;
 import com.codesight.codesight.app.project.services.ProjectUploadService;
@@ -36,6 +38,7 @@ public class ProjectController {
     private final ProjectAnalysisBlueprintService blueprintService;
     private final ChunkedUploadService chunkedUploadService;
     private final PythonAnalysisService pythonAnalysisService;
+    private final FileContentService fileContentService;
 
     @PostMapping
     public ResponseEntity<ProjectResponseDto> createProject(
@@ -173,6 +176,18 @@ public class ProjectController {
     ) {
         return ResponseEntity.ok(
                 blueprintService.getBlueprint(organizationId, projectId, currentUser.getId())
+        );
+    }
+
+    @GetMapping("/{projectId}/file-content")
+    public ResponseEntity<FileContentDto> getFileContent(
+            @PathVariable UUID organizationId,
+            @PathVariable UUID projectId,
+            @RequestParam("path") String path,
+            @AuthenticationPrincipal UserModel currentUser
+    ) {
+        return ResponseEntity.ok(
+                fileContentService.getFileContent(organizationId, projectId, currentUser.getId(), path)
         );
     }
 

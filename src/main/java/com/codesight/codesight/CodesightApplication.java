@@ -13,6 +13,7 @@ import com.codesight.codesight.common.config.StorageProperties;
 public class CodesightApplication {
 
 	public static void main(String[] args) {
+		
 		SpringApplication.run(CodesightApplication.class, args);
 	}
 
