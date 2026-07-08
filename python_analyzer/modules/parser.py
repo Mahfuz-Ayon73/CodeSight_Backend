@@ -206,11 +206,13 @@ def parse_codebase(
 
         bindings       = get_import_bindings(source_code)
         named_bindings = get_all_named_bindings(source_code)
+        import_line_by_path = {entry["path"]: entry["line"] for entry in raw_imports}
 
         internal_targets: list[str] = []
         external_deps:    list[str] = []
 
-        for imp in raw_imports:
+        for entry in raw_imports:
+            imp = entry["path"]
             resolved = resolve_import(imp, canonical, repo_root, registry, aliases, workspace_packages)
             if resolved:
                 internal_targets.append(resolved)
@@ -231,14 +233,18 @@ def parse_codebase(
 
                 target_canonical = resolved
                 edge_type, edge_weight = _classify_edge(canonical, target_canonical)
+                resolved_binding = binding or (next(iter(all_names_for_imp), "") if all_names_for_imp else "")
+                target_line = target_exports.get(called_names[0]) if called_names else target_exports.get(resolved_binding)
                 edges.append({
                     "source_id":      file_id,
                     "target_id":      registry[resolved],
                     "weight":         edge_weight,
                     "edge_type":      edge_type,
-                    "binding":        binding or (next(iter(all_names_for_imp), "") if all_names_for_imp else ""),
+                    "binding":        resolved_binding,
                     "called_names":   called_names,
                     "is_dead_import": not is_live and not called_names,
+                    "source_line":    import_line_by_path.get(imp),
+                    "target_line":    target_line,
                 })
             else:
                 parts = imp.lstrip("@").split("/")

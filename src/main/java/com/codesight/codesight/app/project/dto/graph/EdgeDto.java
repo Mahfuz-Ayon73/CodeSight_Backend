@@ -20,4 +20,10 @@ public class EdgeDto {
 
     @JsonProperty("is_dead_import")
     private Boolean isDeadImport;
+
+    @JsonProperty("source_line")
+    private Integer sourceLine;
+
+    @JsonProperty("target_line")
+    private Integer targetLine;
 }

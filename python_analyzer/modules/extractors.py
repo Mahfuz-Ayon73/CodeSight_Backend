@@ -34,8 +34,8 @@ def _iter_captures(captures, target_names: set) -> list[tuple[str, object]]:
 # Import extraction
 # ---------------------------------------------------------------------------
 
-def extract_imports_treesitter(source_code: str, canonical: str) -> list[str]:
-    """Extract all import/require path strings via Tree-sitter AST."""
+def extract_imports_treesitter(source_code: str, canonical: str) -> list[dict]:
+    """Extract all import/require path strings via Tree-sitter AST, with source line numbers."""
     from tree_sitter import Parser as TSParser
     lang = get_language_for_file(canonical)
     parser = TSParser(lang)
@@ -43,22 +43,22 @@ def extract_imports_treesitter(source_code: str, canonical: str) -> list[str]:
     try:
         query   = get_import_query(lang)
         captures = query.captures(tree.root_node)
-        imports: list[str] = []
+        imports: list[dict] = []
         if isinstance(captures, dict):
             for node in captures.get("import_path", []):
-                imports.append(node.text.decode("utf-8"))
+                imports.append({"path": node.text.decode("utf-8"), "line": node.start_point[0] + 1})
         else:
             for node, cap in captures:
                 if cap == "import_path":
-                    imports.append(node.text.decode("utf-8"))
+                    imports.append({"path": node.text.decode("utf-8"), "line": node.start_point[0] + 1})
         return imports
     except Exception as e:
         print(f"[Parser] Tree-sitter query failed for {canonical}: {e} — falling back to regex.")
         return extract_imports_regex(source_code)
 
 
-def extract_imports_regex(source_code: str) -> list[str]:
-    """Regex fallback — handles both ESM and CommonJS."""
+def extract_imports_regex(source_code: str) -> list[dict]:
+    """Regex fallback — handles both ESM and CommonJS. Returns [{"path", "line"}]."""
     pattern = (
         r"""(?:import\s+[^'"]*\s+from\s+|"""
         r"""from\s+|"""
@@ -66,10 +66,14 @@ def extract_imports_regex(source_code: str) -> list[str]:
         r"""require\s*\(\s*)"""
         r"""['"]([^'"]+)['"]"""
     )
-    return re.findall(pattern, source_code)
+    imports: list[dict] = []
+    for m in re.finditer(pattern, source_code):
+        line = source_code.count("\n", 0, m.start()) + 1
+        imports.append({"path": m.group(1), "line": line})
+    return imports
 
 
-def extract_imports(source_code: str, canonical: str) -> list[str]:
+def extract_imports(source_code: str, canonical: str) -> list[dict]:
     if _TS_AVAILABLE:
         return extract_imports_treesitter(source_code, canonical)
     return extract_imports_regex(source_code)
@@ -79,32 +83,33 @@ def extract_imports(source_code: str, canonical: str) -> list[str]:
 # Export extraction
 # ---------------------------------------------------------------------------
 
-def extract_exports(source_code: str, canonical: str) -> list[str]:
-    """Extract exported identifier names from a file."""
+def extract_exports(source_code: str, canonical: str) -> dict[str, int]:
+    """Extract exported identifier names from a file, mapped to their first-definition line."""
     if not _TS_AVAILABLE:
-        return []
+        return {}
     from tree_sitter import Parser as TSParser
     lang  = get_language_for_file(canonical)
     query = get_export_query(lang)
     if query is None:
-        return []
+        return {}
     try:
         parser_obj = TSParser(lang)
         tree       = parser_obj.parse(bytes(source_code, "utf-8"))
         captures   = query.captures(tree.root_node)
-        names: list[str] = []
+        names: dict[str, int] = {}
 
         for cap_name, node in _iter_captures(captures, EXPORT_QUERY_CAPTURE_NAMES):
             text = node.text.decode("utf-8").strip()
             if not text or len(text) >= 100:
                 continue
+            line = node.start_point[0] + 1
 
             if cap_name == "cjs_named_export":
                 parent = node.parent
                 if parent and parent.type == "member_expression":
                     obj = parent.children[0] if parent.children else None
                     if obj and obj.text.decode() == "exports":
-                        names.append(text)
+                        names.setdefault(text, line)
 
             elif cap_name in ("cjs_shorthand_export", "cjs_pair_export"):
                 obj_node = node.parent
@@ -115,14 +120,14 @@ def extract_exports(source_code: str, canonical: str) -> list[str]:
                         if lhs and lhs.type == "member_expression":
                             lhs_text = lhs.text.decode()
                             if "module.exports" in lhs_text or "exports" in lhs_text:
-                                names.append(text)
+                                names.setdefault(text, line)
 
             else:
-                names.append(text)
+                names.setdefault(text, line)
 
-        return list(set(names))
+        return names
     except Exception:
-        return []
+        return {}
 
 
 # ---------------------------------------------------------------------------

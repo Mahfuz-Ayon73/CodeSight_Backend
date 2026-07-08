@@ -114,6 +114,10 @@ def build_graph(nodes: list[dict], edges: list[dict]) -> nx.DiGraph:
                 G[src][tgt]["is_dead_import"] = (
                     G[src][tgt].get("is_dead_import", True) and edge["is_dead_import"]
                 )
+            if edge.get("source_line") is not None and G[src][tgt].get("source_line") is None:
+                G[src][tgt]["source_line"] = edge["source_line"]
+            if edge.get("target_line") is not None and G[src][tgt].get("target_line") is None:
+                G[src][tgt]["target_line"] = edge["target_line"]
         else:
             initial_type = incoming_type
             initial_weight = 0.0 if incoming_type == "RENDERS" else incoming_weight
@@ -123,6 +127,8 @@ def build_graph(nodes: list[dict], edges: list[dict]) -> nx.DiGraph:
                 binding=edge.get("binding", ""),
                 called_names=edge.get("called_names", []),
                 is_dead_import=edge.get("is_dead_import", False),
+                source_line=edge.get("source_line"),
+                target_line=edge.get("target_line"),
             )
     return G
 

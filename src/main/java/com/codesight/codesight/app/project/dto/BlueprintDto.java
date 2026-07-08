@@ -87,6 +87,12 @@ public class BlueprintDto {
         private Boolean isDeadImport;
 
         private String type;
+
+        @JsonProperty("source_line")
+        private Integer sourceLine;
+
+        @JsonProperty("target_line")
+        private Integer targetLine;
     }
 
     @Data

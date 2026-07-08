@@ -11,9 +11,7 @@ import com.codesight.codesight.common.config.StorageProperties;
 @EnableAsync
 @EnableConfigurationProperties(StorageProperties.class)
 public class CodesightApplication {
-
 	public static void main(String[] args) {
-		
 		SpringApplication.run(CodesightApplication.class, args);
 	}
 
