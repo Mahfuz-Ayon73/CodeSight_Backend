@@ -3,6 +3,7 @@ package com.codesight.codesight.app.project.services;
 import com.codesight.codesight.app.organization.services.OrganizationAccessService;
 import com.codesight.codesight.app.project.dto.ProjectRequestDto;
 import com.codesight.codesight.app.project.dto.ProjectResponseDto;
+import com.codesight.codesight.app.project.dto.ProjectUpdateRequestDto;
 import com.codesight.codesight.app.project.model.AnalysisStatus;
 import com.codesight.codesight.app.project.model.ProjectMemberModel;
 import com.codesight.codesight.app.project.model.ProjectMemberRole;
@@ -99,10 +100,33 @@ public class ProjectService {
         ProjectModel project = projectRepository.findByIdAndOrganizationId(projectId, organizationId)
                 .orElseThrow(() -> new ResourceNotFoundException("Project not found"));
 
-        if (!project.getOwnerId().equals(userId)) {
-            throw new UnauthorizedException("Only the project owner can delete this project");
-        }
+        requireProjectOwnerOrOrgOwner(organizationId, userId, project);
 
         projectRepository.delete(project);
+    }
+
+    @Transactional
+    public ProjectResponseDto updateProject(
+            UUID organizationId, UUID projectId, ProjectUpdateRequestDto request, UUID userId
+    ) {
+        organizationAccessService.requireMembership(organizationId, userId);
+        ProjectModel project = projectRepository.findByIdAndOrganizationId(projectId, organizationId)
+                .orElseThrow(() -> new ResourceNotFoundException("Project not found"));
+
+        requireProjectOwnerOrOrgOwner(organizationId, userId, project);
+
+        project.setDescription(request.getDescription());
+        ProjectModel saved = projectRepository.save(project);
+        return ObjectToDTOMapper.toProjectResponseDto(saved);
+    }
+
+    /** Only the project's own owner or the parent organization's owner may modify/delete it. */
+    private void requireProjectOwnerOrOrgOwner(UUID organizationId, UUID userId, ProjectModel project) {
+        boolean isProjectOwner = project.getOwnerId().equals(userId);
+        boolean isOrgOwner = organizationAccessService.isOrganizationOwner(organizationId, userId);
+
+        if (!isProjectOwner && !isOrgOwner) {
+            throw new UnauthorizedException("Only the project owner or the organization owner can do this");
+        }
     }
 }

@@ -5,6 +5,7 @@ import com.codesight.codesight.app.project.dto.GithubUploadRequestDto;
 import com.codesight.codesight.app.project.dto.GithubUploadStartedDto;
 import com.codesight.codesight.app.project.dto.ProjectRequestDto;
 import com.codesight.codesight.app.project.dto.ProjectResponseDto;
+import com.codesight.codesight.app.project.dto.ProjectUpdateRequestDto;
 import com.codesight.codesight.app.project.services.ChunkedUploadService;
 import com.codesight.codesight.app.project.services.CloneProgressStore;
 import com.codesight.codesight.app.project.services.FileContentService;
@@ -65,6 +66,18 @@ public class ProjectController {
             @AuthenticationPrincipal UserModel currentUser
     ) {
         return ResponseEntity.ok(projectService.getProject(organizationId, projectId, currentUser.getId()));
+    }
+
+    @PatchMapping("/{projectId}")
+    public ResponseEntity<ProjectResponseDto> updateProject(
+            @PathVariable UUID organizationId,
+            @PathVariable UUID projectId,
+            @Valid @RequestBody ProjectUpdateRequestDto request,
+            @AuthenticationPrincipal UserModel currentUser
+    ) {
+        return ResponseEntity.ok(
+                projectService.updateProject(organizationId, projectId, request, currentUser.getId())
+        );
     }
 
     @DeleteMapping("/{projectId}")

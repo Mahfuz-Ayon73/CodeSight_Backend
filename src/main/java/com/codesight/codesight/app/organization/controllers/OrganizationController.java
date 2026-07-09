@@ -1,5 +1,6 @@
 package com.codesight.codesight.app.organization.controllers;
 
+import com.codesight.codesight.app.organization.dto.OrganizationMemberResponseDto;
 import com.codesight.codesight.app.organization.dto.OrganizationRequestDto;
 import com.codesight.codesight.app.organization.dto.OrganizationResponseDto;
 import com.codesight.codesight.app.organization.services.OrganizationService;
@@ -43,5 +44,22 @@ public class OrganizationController {
             @AuthenticationPrincipal UserModel currentUser
     ) {
         return ResponseEntity.ok(organizationService.getOrganization(organizationId, currentUser.getId()));
+    }
+
+    @GetMapping("/{organizationId}/members")
+    public ResponseEntity<List<OrganizationMemberResponseDto>> listMembers(
+            @PathVariable UUID organizationId,
+            @AuthenticationPrincipal UserModel currentUser
+    ) {
+        return ResponseEntity.ok(organizationService.listMembers(organizationId, currentUser.getId()));
+    }
+
+    @DeleteMapping("/{organizationId}")
+    public ResponseEntity<Void> deleteOrganization(
+            @PathVariable UUID organizationId,
+            @AuthenticationPrincipal UserModel currentUser
+    ) {
+        organizationService.deleteOrganization(organizationId, currentUser.getId());
+        return ResponseEntity.noContent().build();
     }
 }
