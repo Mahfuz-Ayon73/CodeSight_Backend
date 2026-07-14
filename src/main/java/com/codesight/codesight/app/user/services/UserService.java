@@ -10,4 +10,5 @@ public interface UserService {
     UserModel findByEmail(String email);
     UserModel save(UserModel user);
     UserResponseDto getUserProfile(UUID id);
+    void changePassword(UUID id, String currentPassword, String newPassword);
 }
