@@ -40,10 +40,11 @@ public class VerificationEmailService {
     }
 
     @Async
-    public void sendInvitationEmail(String recipientEmail, String senderName, String organizationName) {
+    public void sendInvitationEmail(String recipientEmail, String senderName, String organizationName, String acceptUrl) {
         Context context = new Context();
         context.setVariable("senderName", senderName);
         context.setVariable("organizationName", organizationName);
+        context.setVariable("acceptUrl", acceptUrl);
 
         String htmlContent = templateEngine.process("invitation-email-template", context);
         send(recipientEmail, "You've been invited to join " + organizationName + " on CodeSight", htmlContent);

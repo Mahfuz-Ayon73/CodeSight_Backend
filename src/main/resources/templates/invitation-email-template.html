@@ -6,6 +6,7 @@
 <body style="font-family: Arial, sans-serif; padding: 20px;">
     <h2>You have been invited!</h2>
     <p><span th:text="${senderName}">Someone</span> has invited you to join the organization: <strong th:text="${organizationName}">CodeSight Organization</strong>.</p>
-    <p>Please log in to your account to accept or reject the invitation.</p>
+    <a th:href="${acceptUrl}" style="background-color: #06b6d4; color: white; padding: 10px 20px; text-decoration: none; border-radius: 5px; display: inline-block;">View Invitation</a>
+    <p style="margin-top: 20px; color: #888; font-size: 13px;">If you don't have a CodeSight account yet, you'll be able to create one before accepting. This invitation expires in 7 days.</p>
 </body>
 </html>
