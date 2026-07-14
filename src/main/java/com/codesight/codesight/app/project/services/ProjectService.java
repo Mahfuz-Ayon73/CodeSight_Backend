@@ -1,5 +1,6 @@
 package com.codesight.codesight.app.project.services;
 
+import com.codesight.codesight.app.organization.model.OrganizationMemberRole;
 import com.codesight.codesight.app.organization.services.OrganizationAccessService;
 import com.codesight.codesight.app.project.dto.ProjectRequestDto;
 import com.codesight.codesight.app.project.dto.ProjectResponseDto;
@@ -36,7 +37,9 @@ public class ProjectService {
 
     @Transactional
     public ProjectResponseDto createProject(UUID organizationId, ProjectRequestDto request, UUID ownerId) {
-        organizationAccessService.requireMembership(organizationId, ownerId);
+        // Only the organization's owner may create new projects in it — being invited as a
+        // plain member gives access to specific assigned projects, not the right to add more.
+        organizationAccessService.requireRole(organizationId, ownerId, OrganizationMemberRole.OWNER);
 
         ProjectSourceType sourceType = request.getSourceType() != null
                 ? request.getSourceType()
@@ -73,9 +76,12 @@ public class ProjectService {
     }
 
     public ProjectResponseDto getProject(UUID organizationId, UUID projectId, UUID userId) {
-        organizationAccessService.requireMembership(organizationId, userId);
+        OrganizationMemberRole role = organizationAccessService.requireMembership(organizationId, userId);
         ProjectModel project = projectRepository.findByIdAndOrganizationId(projectId, organizationId)
                 .orElseThrow(() -> new ResourceNotFoundException("Project not found"));
+
+        requireProjectVisibility(role, project, userId);
+
         ProjectResponseDto dto = ObjectToDTOMapper.toProjectResponseDto(project);
 
         if (dto.getAnalysisStatus() == AnalysisStatus.IN_PROGRESS) {
@@ -88,8 +94,9 @@ public class ProjectService {
     }
 
     public List<ProjectResponseDto> listProjects(UUID organizationId, UUID userId) {
-        organizationAccessService.requireMembership(organizationId, userId);
+        OrganizationMemberRole role = organizationAccessService.requireMembership(organizationId, userId);
         return projectRepository.findAllByOrganizationId(organizationId).stream()
+                .filter(p -> isProjectVisible(role, p, userId))
                 .map(ObjectToDTOMapper::toProjectResponseDto)
                 .collect(Collectors.toList());
     }
@@ -118,6 +125,22 @@ public class ProjectService {
         project.setDescription(request.getDescription());
         ProjectModel saved = projectRepository.save(project);
         return ObjectToDTOMapper.toProjectResponseDto(saved);
+    }
+
+    /**
+     * A plain org MEMBER only sees/accesses projects they were explicitly added to (or
+     * created themselves) — not every project in the organization. OWNER/ADMIN see all.
+     */
+    private boolean isProjectVisible(OrganizationMemberRole role, ProjectModel project, UUID userId) {
+        if (role != OrganizationMemberRole.MEMBER) return true;
+        return project.getOwnerId().equals(userId)
+                || projectMemberRepository.existsByProjectIdAndUserId(project.getId(), userId);
+    }
+
+    private void requireProjectVisibility(OrganizationMemberRole role, ProjectModel project, UUID userId) {
+        if (!isProjectVisible(role, project, userId)) {
+            throw new UnauthorizedException("You are not a member of this project");
+        }
     }
 
     /** Only the project's own owner or the parent organization's owner may modify/delete it. */

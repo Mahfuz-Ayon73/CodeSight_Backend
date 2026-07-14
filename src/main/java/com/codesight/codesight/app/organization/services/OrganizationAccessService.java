@@ -14,10 +14,11 @@ public class OrganizationAccessService {
 
     private final OrganizationMemberRepository organizationMemberRepository;
 
-    public void requireMembership(UUID organizationId, UUID userId) {
-        if (!organizationMemberRepository.existsByOrganizationIdAndUserId(organizationId, userId)) {
-            throw new UnauthorizedException("You are not a member of this organization");
-        }
+    /** Throws if the user is not a member of the organization; returns their role otherwise. */
+    public OrganizationMemberRole requireMembership(UUID organizationId, UUID userId) {
+        return organizationMemberRepository.findByOrganizationIdAndUserId(organizationId, userId)
+                .orElseThrow(() -> new UnauthorizedException("You are not a member of this organization"))
+                .getRole();
     }
 
     /** Throws if the user does not hold at least the given role. */

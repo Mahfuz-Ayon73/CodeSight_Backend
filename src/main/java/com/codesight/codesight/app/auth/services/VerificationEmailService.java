@@ -4,6 +4,7 @@ import jakarta.mail.MessagingException;
 import jakarta.mail.internet.MimeMessage;
 import lombok.RequiredArgsConstructor;
 import lombok.extern.slf4j.Slf4j;
+import org.springframework.beans.factory.annotation.Value;
 import org.springframework.mail.javamail.JavaMailSender;
 import org.springframework.mail.javamail.MimeMessageHelper;
 import org.springframework.scheduling.annotation.Async;
@@ -19,11 +20,14 @@ public class VerificationEmailService {
     private final TemplateEngine templateEngine;
     private final JavaMailSender mailSender;
 
+    @Value("${app.frontend.url}")
+    private String frontendUrl;
+
     @Async
     public void sendVerificationEmail(String recipientEmail, String recipientName, String token) {
         Context context = new Context();
         context.setVariable("name", recipientName);
-        context.setVariable("verificationUrl", "http://localhost:8081/api/v1/auth/verify?token=" + token);
+        context.setVariable("verificationUrl", frontendUrl + "/verify-email?token=" + token);
 
         String htmlContent = templateEngine.process("account-verification-email-template", context);
         send(recipientEmail, "Verify your CodeSight account", htmlContent);

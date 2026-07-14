@@ -1,5 +1,6 @@
 package com.codesight.codesight.app.organization.dto;
 
+import com.codesight.codesight.app.organization.model.OrganizationMemberRole;
 import lombok.AllArgsConstructor;
 import lombok.Builder;
 import lombok.Data;
@@ -20,4 +21,6 @@ public class OrganizationResponseDto {
     private UUID createdByUserId;
     private LocalDateTime createdAt;
     private LocalDateTime updatedAt;
+    /** The requesting user's own role in this organization (OWNER/ADMIN/MEMBER). */
+    private OrganizationMemberRole myRole;
 }

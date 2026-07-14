@@ -52,22 +52,30 @@ public class OrganizationService {
                 .role(OrganizationMemberRole.OWNER)
                 .build());
 
-        return ObjectToDTOMapper.toOrganizationResponseDto(saved);
+        OrganizationResponseDto dto = ObjectToDTOMapper.toOrganizationResponseDto(saved);
+        dto.setMyRole(OrganizationMemberRole.OWNER);
+        return dto;
     }
 
     public OrganizationResponseDto getOrganization(UUID organizationId, UUID userId) {
-        organizationAccessService.requireMembership(organizationId, userId);
+        OrganizationMemberRole role = organizationAccessService.requireMembership(organizationId, userId);
         OrganizationModel organization = organizationRepository.findById(organizationId)
                 .orElseThrow(() -> new ResourceNotFoundException("Organization not found"));
-        return ObjectToDTOMapper.toOrganizationResponseDto(organization);
+        OrganizationResponseDto dto = ObjectToDTOMapper.toOrganizationResponseDto(organization);
+        dto.setMyRole(role);
+        return dto;
     }
 
     public List<OrganizationResponseDto> listMyOrganizations(UUID userId) {
         return organizationMemberRepository.findAllByUserId(userId).stream()
-                .map(member -> organizationRepository.findById(member.getOrganizationId()))
+                .map(member -> organizationRepository.findById(member.getOrganizationId())
+                        .map(org -> {
+                            OrganizationResponseDto dto = ObjectToDTOMapper.toOrganizationResponseDto(org);
+                            dto.setMyRole(member.getRole());
+                            return dto;
+                        }))
                 .filter(java.util.Optional::isPresent)
                 .map(java.util.Optional::get)
-                .map(ObjectToDTOMapper::toOrganizationResponseDto)
                 .collect(Collectors.toList());
     }
 
