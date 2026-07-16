@@ -4,6 +4,8 @@ import com.fasterxml.jackson.annotation.JsonIgnoreProperties;
 import com.fasterxml.jackson.annotation.JsonProperty;
 import lombok.Data;
 
+import java.util.List;
+
 @Data
 @JsonIgnoreProperties(ignoreUnknown = true)
 public class ClusterDto {
@@ -18,4 +20,15 @@ public class ClusterDto {
 
     @JsonProperty("functional_summary")
     private String functionalSummary;
+
+    private String domain;
+
+    @JsonProperty("domain_type")
+    private String domainType;
+
+    @JsonProperty("domain_confidence")
+    private Double domainConfidence;
+
+    @JsonProperty("domain_evidence")
+    private List<String> domainEvidence;
 }

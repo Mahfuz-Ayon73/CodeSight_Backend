@@ -185,6 +185,8 @@ public class SnapshotPersistenceService {
                 entry.put("cluster_id", c.getId());
                 entry.put("title", c.getSuggestedTitle() != null ? c.getSuggestedTitle() : c.getName());
                 entry.put("summary", c.getFunctionalSummary());
+                entry.put("domain", c.getDomain());
+                entry.put("domain_type", c.getDomainType());
                 entry.put("node_count", nodeCount.getOrDefault(c.getId(), 0));
                 summary.add(entry);
             }

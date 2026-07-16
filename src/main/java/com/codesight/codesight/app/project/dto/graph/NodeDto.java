@@ -31,4 +31,12 @@ public class NodeDto {
 
     @JsonProperty("text_summary")
     private String textSummary;
+
+    private String domain;
+
+    @JsonProperty("domain_confidence")
+    private Double domainConfidence;
+
+    @JsonProperty("domain_source")
+    private String domainSource;
 }
