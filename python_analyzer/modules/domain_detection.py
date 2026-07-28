@@ -9,6 +9,11 @@ Every *file* is scored individually, then clusters aggregate their members:
     name seeds — domain lexicon keywords found in the file's own path tokens
       (folder + filename) seed it at confidence 0.75. When both signals agree
       the seed is 0.95; when they disagree the dependency signal wins.
+    emergent seeds — recurring repo-specific tokens ("student", "scholarship")
+      outside the canonical taxonomy become open-set seed domains at 0.65, so
+      DDD-style codebases get their own domain names instead of UNCLASSIFIED.
+    Tokens present in > NAME_SEED_MAX_DF of all files (repo name, top-level
+    dirs) are stripped before matching — they discriminate nothing.
 
   Propagation (semi-supervised, graph-level):
     seed labels spread along the import graph (undirected, weighted) with a
@@ -49,6 +54,13 @@ import numpy as np
 SEED_DEP_CONF      = 0.90   # file imports a known domain package
 SEED_NAME_CONF     = 0.75   # file's own path carries domain keywords
 SEED_BOTH_CONF     = 0.95   # both signals agree
+SEED_EMERGENT_CONF = 0.65   # file's path carries a repo-specific recurring token
+NAME_SEED_MAX_DF   = 0.60   # tokens in more than this fraction of files seed nothing
+                            # (kills repo-name poisoning: "A2E-Admin-Backend/" put an
+                            #  ADMIN token in 100% of paths)
+EMERGENT_SEED_MIN_FILES = 3     # open-set token must recur in at least this many files
+EMERGENT_SEED_MAX_DF    = 0.50  # ...but still be discriminating within the repo
+EMERGENT_SEED_MAX_DOMAINS = 12  # cap open-set domains so the map stays readable
 PROPAGATION_DECAY  = 0.85   # per-hop retention of neighbor scores
 MAX_ITERATIONS     = 30
 CONVERGENCE_TOL    = 1e-4
@@ -170,6 +182,10 @@ _STRUCTURAL_STOPWORDS = frozenset({
     "component", "components", "page", "pages", "view", "views",
     "hook", "hooks", "layout", "layouts", "style", "styles",
     "asset", "assets", "public", "core", "base", "api", "data",
+    "feature", "features", "module", "modules",
+    "package", "packages", "domain", "domains",
+    "template", "templates", "validator", "validators",
+    "swagger", "annotation", "annotations",
     "old", "new", "js", "ts", "jsx", "tsx", "mjs", "cjs",
 })
 
@@ -225,31 +241,74 @@ def _dep_seed(node: dict) -> tuple[str, list[str]] | None:
     return domain, sorted(deps)
 
 
-def _name_seed(node: dict) -> tuple[str, list[str]] | None:
+def _name_seed(tokens: frozenset[str]) -> tuple[str, list[str]] | None:
     """Domain voted by keywords in the file's own path tokens. Ambiguous -> None."""
-    path_tokens = _tokenize(node.get("canonical_path", ""))
-    if not path_tokens:
+    if not tokens:
         return None
     hits = {
-        domain: path_tokens & lexicon
+        domain: tokens & lexicon
         for domain, lexicon in _DOMAIN_LEXICONS.items()
-        if path_tokens & lexicon
+        if tokens & lexicon
     }
     if not hits:
         return None
     ranked = sorted(hits.items(), key=lambda kv: len(kv[1]), reverse=True)
     if len(ranked) > 1 and len(ranked[0][1]) == len(ranked[1][1]):
         return None
-    domain, tokens = ranked[0]
-    return domain, sorted(tokens)
+    domain, matched = ranked[0]
+    return domain, sorted(matched)
 
 
-def _build_seeds(members: list[dict]) -> dict[int, tuple[str, float, str, str]]:
-    """node_id -> (domain, confidence, source, evidence). Dependency beats name on conflict."""
+_ALL_LEXICON_TOKENS = frozenset().union(*_DOMAIN_LEXICONS.values())
+
+
+def _common_and_emergent_tokens(
+    path_tokens: dict[int, frozenset[str]],
+) -> tuple[frozenset[str], frozenset[str]]:
+    """
+    Document-frequency split of the repo's path vocabulary:
+      common   — tokens in > NAME_SEED_MAX_DF of files; zero discriminating power
+                 (repo name, top-level dirs), banned from all seeding.
+      emergent — recurring, discriminating, non-canonical tokens
+                 (e.g. "student", "scholarship"): open-set seed domains for
+                 codebases whose real domains aren't in the canonical taxonomy.
+    """
+    n = len(path_tokens)
+    if n == 0:
+        return frozenset(), frozenset()
+    df: Counter = Counter()
+    for tokens in path_tokens.values():
+        df.update(tokens)
+    common = frozenset(t for t, c in df.items() if c / n > NAME_SEED_MAX_DF)
+    candidates = [
+        (c, t) for t, c in df.items()
+        if t not in common and t not in _ALL_LEXICON_TOKENS
+        and len(t) >= 4
+        and c >= EMERGENT_SEED_MIN_FILES and c / n <= EMERGENT_SEED_MAX_DF
+    ]
+    candidates.sort(reverse=True)
+    emergent = frozenset(t for _, t in candidates[:EMERGENT_SEED_MAX_DOMAINS])
+    return common, emergent
+
+
+def _build_seeds(
+    members: list[dict],
+) -> tuple[dict[int, tuple[str, float, str, str]], frozenset[str]]:
+    """
+    Returns (node_id -> (domain, confidence, source, evidence), repo-common tokens).
+    Priority: dependency > canonical name > emergent name. Repo-common tokens
+    (document frequency > NAME_SEED_MAX_DF) are stripped before any name match.
+    """
+    path_tokens = {
+        node["id"]: _tokenize(node.get("canonical_path", "")) for node in members
+    }
+    common, emergent = _common_and_emergent_tokens(path_tokens)
+
     seeds: dict[int, tuple[str, float, str, str]] = {}
     for node in members:
+        tokens = path_tokens[node["id"]] - common
         dep = _dep_seed(node)
-        name = _name_seed(node)
+        name = _name_seed(tokens)
         if dep and name and dep[0] == name[0]:
             seeds[node["id"]] = (
                 dep[0], SEED_BOTH_CONF, "seed:dependency+name",
@@ -265,7 +324,15 @@ def _build_seeds(members: list[dict]) -> dict[int, tuple[str, float, str, str]]:
                 name[0], SEED_NAME_CONF, "seed:name",
                 f"path tokens [{', '.join(name[1])}]",
             )
-    return seeds
+        else:
+            open_hits = tokens & emergent
+            if len(open_hits) == 1:  # several candidate tokens = ambiguous, let propagation decide
+                token = next(iter(open_hits))
+                seeds[node["id"]] = (
+                    token.capitalize(), SEED_EMERGENT_CONF, "seed:name-emergent",
+                    f"recurring path token [{token}]",
+                )
+    return seeds, common
 
 
 # ---------------------------------------------------------------------------
@@ -389,14 +456,16 @@ def _aggregate_cluster(members: list[dict], seeds: dict) -> tuple[str, float, li
     return top_domain, confidence, evidence
 
 
-def _classify_emergent(members: list[dict]) -> tuple[str, float, list[str]] | None:
+def _classify_emergent(
+    members: list[dict], exclude: frozenset[str] = frozenset()
+) -> tuple[str, float, list[str]] | None:
     """Open-set fallback: name the domain after the cluster's dominant path token."""
     n = len(members)
     if n < EMERGENT_MIN_FILES:
         return None
     token_files: Counter = Counter()
     for node in members:
-        token_files.update(_tokenize(node.get("canonical_path", ""), min_len=4))
+        token_files.update(_tokenize(node.get("canonical_path", ""), min_len=4) - exclude)
     if not token_files:
         return None
     token, count = token_files.most_common(1)[0]
@@ -413,6 +482,12 @@ def _classify_emergent(members: list[dict]) -> tuple[str, float, list[str]] | No
 # ---------------------------------------------------------------------------
 
 _INFRA_CLUSTER_NAMES = frozenset({"Shared Infrastructure", "DevOps & Database Migrations"})
+
+_CANONICAL_DOMAINS = (
+    frozenset(_DOMAIN_LEXICONS)
+    | frozenset(_DEP_EXACT.values())
+    | frozenset(domain for _, domain in _DEP_PREFIX)
+)
 
 
 def _is_infra_cluster(cluster: dict) -> bool:
@@ -435,7 +510,7 @@ def detect_domains(clusters: list[dict], nodes: list[dict], edges: list[dict]) -
             infra_ids.update(cluster.get("node_ids", []))
 
     active = [n for n in nodes if n["id"] not in infra_ids]
-    seeds = _build_seeds(active)
+    seeds, common_tokens = _build_seeds(active)
     scores, domains, idx_of = _propagate([n["id"] for n in active], seeds, edges)
     _classify_nodes(active, scores, domains, idx_of, seeds)
     for nid in infra_ids:
@@ -458,12 +533,11 @@ def detect_domains(clusters: list[dict], nodes: list[dict], edges: list[dict]) -
             result, domain_type = None, "UNCLASSIFIED"
         else:
             result = _aggregate_cluster(members, seeds)
-            domain_type = "CANONICAL"
-            if result is None:
-                result = _classify_emergent(members)
-                domain_type = "EMERGENT"
-            if result is None:
-                domain_type = "UNCLASSIFIED"
+            if result is not None:
+                domain_type = "CANONICAL" if result[0] in _CANONICAL_DOMAINS else "EMERGENT"
+            else:
+                result = _classify_emergent(members, exclude=common_tokens)
+                domain_type = "EMERGENT" if result is not None else "UNCLASSIFIED"
 
         if result is None:
             cluster["domain"] = None
@@ -480,7 +554,9 @@ def detect_domains(clusters: list[dict], nodes: list[dict], edges: list[dict]) -
 
     print(f"[DomainDetection] {len(seeds)} seed files "
           f"({sum(1 for s in seeds.values() if 'dependency' in s[2])} dep, "
-          f"{sum(1 for s in seeds.values() if s[2] == 'seed:name')} name-only), "
+          f"{sum(1 for s in seeds.values() if s[2] == 'seed:name')} name, "
+          f"{sum(1 for s in seeds.values() if s[2] == 'seed:name-emergent')} emergent), "
+          f"{len(common_tokens)} repo-common tokens ignored, "
           f"{labeled_nodes}/{len(active)} files labeled after propagation; "
           f"{counts.get('CANONICAL', 0)} canonical, "
           f"{counts.get('EMERGENT', 0)} emergent, "
