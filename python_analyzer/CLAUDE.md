@@ -1,6 +1,6 @@
 # CodeSight Python Analysis Engine
 
-FastAPI microservice (`http://127.0.0.1:8000`) that ingests a JS/TS codebase and emits a `graph_blueprint.json` (schema v2.0, flat relational) plus a `cluster_analytics.json`. Called by Spring's `PythonAnalysisService` via `/analyze/sync`, `/analyze`, or `/analyze/{projectId}/status`.
+FastAPI microservice (`http://127.0.0.1:8000`) that ingests a JS/TS codebase and emits a `graph_blueprint.json` (schema v2.1, flat relational) plus a `cluster_analytics.json`. Called by Spring's `PythonAnalysisService` via `/analyze/sync`, `/analyze`, or `/analyze/{projectId}/status`.
 
 ## Run
 
@@ -27,7 +27,7 @@ State: `queued → running → completed/failed`. Lost on restart (in-memory onl
 
 ```
 crawl() → partition_registry() → save_registry()
-parse_codebase() → cluster_codebase() → label_clusters()
+parse_codebase() → cluster_codebase() → detect_domains() → label_clusters()
 build_blueprint() → generate_analytics() → [purge_source_files()]
 ```
 
@@ -114,6 +114,17 @@ Two-pass hierarchical; guarantees every leaf has 1–`MAX_CLUSTER_SIZE=30` files
 
 `build_layer_word_set` dynamically augments the static layer-word frozenset (controller/service/route/.../test/...) with tokens appearing in ≥35% of canonicals, then `extract_domain_tokens` filters those out for domain matching.
 
+## Phase 3.5 — Domain Detection (`modules/domain_detection.py`)
+
+`detect_domains(clusters, nodes, edges)` — seeded **label propagation** at file granularity, then purity-gated cluster aggregation. Runs between clustering and labeling. Mutates **nodes** with `domain` / `domain_confidence` / `domain_source` (`seed:dependency` | `seed:name` | `seed:dependency+name` | `propagated` | `None`) and **clusters** with `domain`, `domain_type` (`CANONICAL|EMERGENT|INFRASTRUCTURE|UNCLASSIFIED`), `domain_confidence` (0–1), `domain_evidence` (strings).
+
+1. **Seeding (per file)** — dependency seeds: known packages (`_DEP_EXACT` + `_DEP_PREFIX`, subpath imports normalized to package root) → domain at `SEED_DEP_CONF=0.90`; name seeds: `_DOMAIN_LEXICONS` keywords in the file's own path tokens → `SEED_NAME_CONF=0.75`; both agree → `SEED_BOTH_CONF=0.95`, disagree → dependency wins. A tie between two domains within one signal (e.g. `auth/signup/` hits both AUTHENTICATION and REGISTRATION) → no seed, deliberately. **Document-frequency guard**: tokens in >`NAME_SEED_MAX_DF=0.60` of all files are stripped before any matching (a repo named `A2E-Admin-Backend/` must not make every file ADMIN). **Emergent seeds** (open-set, priority below dep/name): recurring discriminating tokens (≥`EMERGENT_SEED_MIN_FILES=3` files, ≤`EMERGENT_SEED_MAX_DF=0.50` DF, non-lexicon, top `EMERGENT_SEED_MAX_DOMAINS=12` by count) seed their capitalized token (e.g. `Student`, `Scholarship`) at `SEED_EMERGENT_CONF=0.65` when a file hits exactly one candidate — this is what makes layer-first/DDD repos work.
+2. **Propagation** — undirected weighted graph from raw `app_edges` (`RENDERS` and weight ≤0 excluded; dead imports ×`DEAD_IMPORT_FACTOR=0.3`; synthetic convention edges participate at their 0.4 weight). NumPy label spreading: `F_new = DECAY(0.85) · rownorm(W) · F`, seeds hard-clamped each iteration, ≤30 iterations / tol 1e-4, so scores decay monotonically with distance from evidence. A file labeled only when top score ≥`NODE_MIN_SCORE=0.15` **and** ≥`NODE_MARGIN=1.5`× runner-up — boundary files pulled by several domains stay `None` by design. Infra nodes (`c_global_shared`, DevOps) are excluded from the propagation graph so shared utilities don't bleed labels across domains.
+3. **Aggregation (per cluster)** — majority domain of member files wins only at share ≥`CLUSTER_MIN_SHARE=0.40` of ALL members and ≥`CLUSTER_MARGIN=1.5`× runner-up file-count; confidence = share × mean winner confidence (low share ⇒ visibly low confidence). `domain_type` = CANONICAL iff the winner is in the canonical taxonomy (lexicons ∪ dep-map values), else EMERGENT. Mixed clusters fall through.
+4. **Emergent** — open-set fallback (unchanged): dominant path token covering ≥`EMERGENT_MIN_COVERAGE=0.40` of ≥2 files names the domain (e.g. `Inventory`). Confidence = coverage, ≤0.8.
+
+`c_global_shared` / DevOps clusters → `INFRASTRUCTURE`. Uses its **own** `_STRUCTURAL_STOPWORDS` tokenizer (min len 3), NOT `clustering._LAYER_WORDS` — that set filters "email"/"settings", which carry domain meaning here. Singular "integration" is deliberately absent from lexicons (integration-test dirs). Canonical taxonomy: AUTHENTICATION, REGISTRATION, PAYMENTS, USER_PROFILE, EMAIL_NOTIFICATION, ADMIN, FILE_STORAGE, SEARCH, API_INTEGRATION.
+
 ## Phase 4 — Labeling (`modules/summarizer.py`)
 
 For each cluster: top 5 nodes by `centrality_score`, build `PROMPT_TEMPLATE` prompt, call `LLMProvider.complete(prompt)`. `OpenAIProvider` (gpt-4o-mini, temp 0.2, max_tokens 200) or `OllamaProvider` (urllib POST to `/api/generate`). Response is regex-extracted for `{"title", "summary"}`. Failure → `_auto_title`: most-common parent dir name + " Module".
@@ -122,26 +133,32 @@ LLM is optional; `get_llm_provider()` returns `None` for unconfigured/missing ke
 
 ## Phase 5 — Output (`analyzer.build_blueprint`)
 
-Schema v2.0, **flat relational** — no nested children, no duplicated nodes:
+Schema v2.2, **flat relational** — no nested children, no duplicated nodes:
 
 ```json
 {
-  "schema_version": "2.0",
+  "schema_version": "2.2",
   "project_id": "<uuid>",
   "project_metadata": {
     "detected_paradigm": "<see paradigm list>",
     "total_nodes_indexed": N, "total_edges": N, "total_clusters": N,
-    "max_cluster_size": N
+    "max_cluster_size": N,
+    "detected_domains": ["AUTHENTICATION", "Inventory", "..."]
   },
   "clusters": [
     {"id": "c_0001", "name": "...", "parent_cluster_id": null|"c_xxxx",
-     "suggested_title": "...", "functional_summary": "..."}
+     "suggested_title": "...", "functional_summary": "...",
+     "domain": "PAYMENTS"|"Inventory"|null,
+     "domain_type": "CANONICAL|EMERGENT|INFRASTRUCTURE|UNCLASSIFIED",
+     "domain_confidence": 0.88, "domain_evidence": ["dependency:stripe (2/3 files)"]}
   ],
   "nodes": [
     {"id": "<canonical_path>", "cluster_id": "c_xxxx",
      "canonical_path": "...", "centrality_score": 0.0,
      "is_god_file": false, "execution_role": "ENTRY_POINT|TERMINAL_SINK|INTERNAL|SHARED_DEPENDENCY",
-     "external_dependencies": ["react", "..."], "text_summary": "..."}
+     "external_dependencies": ["react", "..."], "text_summary": "...",
+     "domain": "PAYMENTS"|null, "domain_confidence": 0.64,
+     "domain_source": "seed:dependency|seed:name|seed:dependency+name|propagated"|null}
   ],
   "edges": [
     {"source": "<path>", "target": "<path>",
@@ -189,5 +206,6 @@ Reads `graph_blueprint.json` (string `id`s, `nodes[].cluster_id` linkage) and wr
 | `modules/naming_conventions.py` | Layer-tier inference + domain-token matching → synthetic `BELONGS_TO_DOMAIN` edges weight 0.4 |
 | `modules/routing_conventions.py` | Next.js App Router sibling + nearest-ancestor-layout synthetic edges weight 0.4 |
 | `modules/clustering.py` | Two-pass hierarchical clustering, Leiden→Louvain→WCC fallback, god-file/shared-dep/orchestrator handling, embedding-cosine orphan recovery, `SEMANTIC_SIMILARITY` edge injection |
+| `modules/domain_detection.py` | Seeded label propagation (dep+name file seeds → NumPy label spreading → purity-gated cluster aggregation → emergent dominant-token fallback), own stopword tokenizer, canonical taxonomy |
 | `modules/summarizer.py` | `LLMProvider` protocol, `OpenAIProvider`/`OllamaProvider`, `get_llm_provider`, `label_clusters`, `_auto_title` |
 | `storage/analysis/<project_id>/<analysis_id>/` | Per-analysis output: `graph_blueprint.json`, `cluster_analytics.json`, `file_registry.json` |

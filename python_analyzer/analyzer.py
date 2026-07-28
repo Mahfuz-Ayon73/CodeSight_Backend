@@ -24,6 +24,7 @@ from typing import Callable, Optional
 from modules.ingestion import crawl, save_registry, partition_registry
 from modules.parser import parse_codebase, detect_module_system
 from modules.clustering import cluster_codebase
+from modules.domain_detection import detect_domains
 from modules.summarizer import label_clusters, get_llm_provider
 from cluster_analytics import generate as generate_analytics
 
@@ -76,6 +77,9 @@ def build_blueprint(
             "execution_role":       g_node.get("execution_role", "INTERNAL"),
             "external_dependencies": node.get("external_dependencies", []),
             "text_summary":         node.get("text_summary", ""),
+            "domain":               node.get("domain"),
+            "domain_confidence":    node.get("domain_confidence", 0.0),
+            "domain_source":        node.get("domain_source"),
         })
 
     # Build flat edges array — use canonical paths as source/target.
@@ -116,10 +120,19 @@ def build_blueprint(
             "parent_cluster_id": cluster.get("parent_cluster_id"),
             "suggested_title":  cluster.get("suggested_title"),
             "functional_summary": cluster.get("functional_summary"),
+            "domain":            cluster.get("domain"),
+            "domain_type":       cluster.get("domain_type", "UNCLASSIFIED"),
+            "domain_confidence": cluster.get("domain_confidence", 0.0),
+            "domain_evidence":   cluster.get("domain_evidence", []),
         })
 
+    detected_domains = sorted({
+        c.get("domain") for c in clusters
+        if c.get("domain") and c.get("domain_type") in ("CANONICAL", "EMERGENT")
+    })
+
     return {
-        "schema_version": "2.0",
+        "schema_version": "2.2",
         "project_id": project_id,
         "project_metadata": {
             "detected_paradigm":   paradigm,
@@ -127,6 +140,7 @@ def build_blueprint(
             "total_edges":         len(flat_edges),
             "total_clusters":      len(flat_clusters),
             "max_cluster_size":    max((len(c.get("node_ids", [])) for c in clusters), default=0),
+            "detected_domains":    detected_domains,
         },
         "clusters": flat_clusters,
         "nodes":    flat_nodes,
@@ -259,6 +273,10 @@ def run_analysis(
     graph, clusters, execution_flows = cluster_codebase(
         app_nodes, app_edges, embeddings, admin_nodes=admin_nodes
     )
+
+    # Phase 3.5: Domain detection (name+dep seeds -> label propagation -> purity-gated aggregation)
+    _report("domain_detection", "Detecting functional domains...")
+    clusters = detect_domains(clusters, nodes, app_edges)
 
     # Phase 4: Label
     _report("labeling", "Labeling clusters with AI summaries...")

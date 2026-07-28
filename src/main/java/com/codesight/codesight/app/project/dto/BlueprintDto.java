@@ -68,6 +68,14 @@ public class BlueprintDto {
 
         @JsonProperty("text_summary")
         private String textSummary;
+
+        private String domain;
+
+        @JsonProperty("domain_confidence")
+        private Double domainConfidence;
+
+        @JsonProperty("domain_source")
+        private String domainSource;
     }
 
     @Data
@@ -111,5 +119,16 @@ public class BlueprintDto {
 
         @JsonProperty("functional_summary")
         private String functionalSummary;
+
+        private String domain;
+
+        @JsonProperty("domain_type")
+        private String domainType;
+
+        @JsonProperty("domain_confidence")
+        private Double domainConfidence;
+
+        @JsonProperty("domain_evidence")
+        private List<String> domainEvidence;
     }
 }
