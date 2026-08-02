@@ -33,7 +33,7 @@ public class GithubCloneService {
         }
 
         if (!trimmed.endsWith(".git")) {
-            trimmed = trimmed.endsWith("/") ? trimmed + ".git" : trimmed + ".git";
+            trimmed = trimmed.endsWith("/") ? trimmed.substring(0, trimmed.length() - 1) + ".git" : trimmed + ".git";
         }
 
         return trimmed;

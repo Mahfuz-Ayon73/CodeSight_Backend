@@ -104,22 +104,6 @@ public class ProjectController {
         );
     }
 
-    /**
-     * Upload a source folder from the browser. Use {@code <input type="file" webkitdirectory directory multiple />}
-     * so each part keeps its relative path in the original filename (e.g. {@code src/app/page.tsx}).
-     */
-    @PostMapping(value = "/{projectId}/upload/folder", consumes = MediaType.MULTIPART_FORM_DATA_VALUE)
-    public ResponseEntity<ProjectResponseDto> uploadFolder(
-            @PathVariable UUID organizationId,
-            @PathVariable UUID projectId,
-            @RequestParam("files") List<MultipartFile> files,
-            @AuthenticationPrincipal UserModel currentUser
-    ) throws IOException {
-        return ResponseEntity.ok(
-                projectUploadService.uploadFolder(organizationId, projectId, currentUser.getId(), files)
-        );
-    }
-
     @PostMapping("/{projectId}/upload/github")
     public ResponseEntity<GithubUploadStartedDto> uploadGithub(
             @PathVariable UUID organizationId,
