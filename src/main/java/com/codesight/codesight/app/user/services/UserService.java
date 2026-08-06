@@ -11,4 +11,5 @@ public interface UserService {
     UserModel save(UserModel user);
     UserResponseDto getUserProfile(UUID id);
     void changePassword(UUID id, String currentPassword, String newPassword);
+    void setLastOrganization(UUID id, UUID organizationId);
 }

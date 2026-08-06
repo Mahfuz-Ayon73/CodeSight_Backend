@@ -8,6 +8,8 @@ import com.codesight.codesight.app.organization.model.OrganizationMemberRole;
 import com.codesight.codesight.app.organization.model.OrganizationModel;
 import com.codesight.codesight.app.organization.repository.OrganizationMemberRepository;
 import com.codesight.codesight.app.organization.repository.OrganizationRepository;
+import com.codesight.codesight.app.project.model.ProjectModel;
+import com.codesight.codesight.app.project.repository.ProjectMemberRepository;
 import com.codesight.codesight.app.project.repository.ProjectRepository;
 import com.codesight.codesight.app.user.model.UserModel;
 import com.codesight.codesight.app.user.repository.UserRepository;
@@ -31,6 +33,7 @@ public class OrganizationService {
     private final OrganizationMemberRepository organizationMemberRepository;
     private final OrganizationAccessService organizationAccessService;
     private final ProjectRepository projectRepository;
+    private final ProjectMemberRepository projectMemberRepository;
     private final UserRepository userRepository;
 
     @Transactional
@@ -112,8 +115,51 @@ public class OrganizationService {
             throw new ConflictException("Cannot delete an organization that still has projects");
         }
 
+        List<UUID> memberUserIds = organizationMemberRepository.findAllByOrganizationId(organizationId).stream()
+                .map(OrganizationMemberModel::getUserId)
+                .collect(Collectors.toList());
+
         organizationMemberRepository.deleteAllByOrganizationId(organizationId);
         organizationRepository.delete(organization);
+
+        memberUserIds.forEach(userId -> clearLastOrganizationIfMatches(userId, organizationId));
+    }
+
+    /**
+     * Remove the requester's own membership from an organization. The OWNER cannot
+     * leave this way — they must delete the organization instead, since there is no
+     * ownership-transfer flow to hand the org off to someone else first.
+     */
+    @Transactional
+    public void leaveOrganization(UUID organizationId, UUID requesterId) {
+        OrganizationMemberRole role = organizationAccessService.requireMembership(organizationId, requesterId);
+
+        if (role == OrganizationMemberRole.OWNER) {
+            throw new ConflictException("The organization owner cannot leave — delete the organization instead");
+        }
+
+        for (ProjectModel project : projectRepository.findAllByOrganizationId(organizationId)) {
+            projectMemberRepository.deleteByProjectIdAndUserId(project.getId(), requesterId);
+        }
+
+        organizationMemberRepository.deleteByOrganizationIdAndUserId(organizationId, requesterId);
+
+        clearLastOrganizationIfMatches(requesterId, organizationId);
+    }
+
+    /**
+     * Drop the "land me back here next login" pointer when it names an organization
+     * the user is no longer in, so it can't send them somewhere they'd immediately
+     * be refused. Callers still validate membership when resolving it; this just
+     * stops a dead pointer from outliving the membership.
+     */
+    private void clearLastOrganizationIfMatches(UUID userId, UUID organizationId) {
+        userRepository.findById(userId)
+                .filter(user -> organizationId.equals(user.getLastOrganizationId()))
+                .ifPresent(user -> {
+                    user.setLastOrganizationId(null);
+                    userRepository.save(user);
+                });
     }
 
     private String generateUniqueSlug(String name) {

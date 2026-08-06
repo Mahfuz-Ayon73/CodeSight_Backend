@@ -76,4 +76,13 @@ public class OrganizationController {
         organizationService.deleteOrganization(organizationId, currentUser.getId());
         return ResponseEntity.noContent().build();
     }
+
+    @DeleteMapping("/{organizationId}/members/me")
+    public ResponseEntity<Void> leaveOrganization(
+            @PathVariable UUID organizationId,
+            @AuthenticationPrincipal UserModel currentUser
+    ) {
+        organizationService.leaveOrganization(organizationId, currentUser.getId());
+        return ResponseEntity.noContent().build();
+    }
 }

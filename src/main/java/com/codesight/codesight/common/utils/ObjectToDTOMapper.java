@@ -23,6 +23,7 @@ public class ObjectToDTOMapper {
                 .isEnabled(user.isEnabled())
                 .createdAt(user.getCreatedAt())
                 .updatedAt(user.getUpdatedAt())
+                .lastOrganizationId(user.getLastOrganizationId())
                 .build();
     }
 

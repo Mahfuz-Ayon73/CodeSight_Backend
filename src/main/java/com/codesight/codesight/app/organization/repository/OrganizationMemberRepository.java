@@ -3,6 +3,7 @@ package com.codesight.codesight.app.organization.repository;
 import com.codesight.codesight.app.organization.model.OrganizationMemberModel;
 import org.springframework.data.jpa.repository.JpaRepository;
 import org.springframework.stereotype.Repository;
+import org.springframework.transaction.annotation.Transactional;
 
 import java.util.List;
 import java.util.Optional;
@@ -19,4 +20,7 @@ public interface OrganizationMemberRepository extends JpaRepository<Organization
     List<OrganizationMemberModel> findAllByOrganizationId(UUID organizationId);
 
     void deleteAllByOrganizationId(UUID organizationId);
+
+    @Transactional
+    void deleteByOrganizationIdAndUserId(UUID organizationId, UUID userId);
 }
