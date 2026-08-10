@@ -7,6 +7,7 @@ Delegates to:
   import_resolver      — alias loading, path resolution, binding helpers
   embeddings           — text preprocessing & vector generation
   naming_conventions   — synthetic edge injection
+  contracts            — string-keyed runtime links (HTTP routes, events)
 """
 
 import re
@@ -15,7 +16,10 @@ from pathlib import Path
 import numpy as np
 
 from modules.treesitter_setup import _TS_AVAILABLE
-from modules.extractors import extract_imports, extract_exports, extract_callsites, extract_ref_usages
+from modules.extractors import (
+    extract_imports, extract_exports, extract_callsites, extract_ref_usages,
+    extract_call_arguments,
+)
 from modules.import_resolver import (
     load_path_aliases, load_workspace_packages, resolve_import,
     get_import_bindings, get_all_named_bindings,
@@ -23,6 +27,8 @@ from modules.import_resolver import (
 from modules.embeddings import preprocess_text, generate_embeddings
 from modules.naming_conventions import inject_naming_convention_edges
 from modules.routing_conventions import inject_routing_convention_edges
+from modules.contracts import inject_contract_edges
+from modules.shared_state import inject_state_edges
 
 
 # ---------------------------------------------------------------------------
@@ -154,6 +160,9 @@ def parse_codebase(
     edges:      list[dict] = []
     texts:      list[str]  = []
     file_data:  dict[str, dict] = {}
+    # {source file: {local binding name: imported file}} — lets contracts.py
+    # resolve `app.use("/api/auth", authRoutes)` to the file `authRoutes` is.
+    binding_targets: dict[str, dict[str, str]] = {}
 
     sorted_files = sorted(registry.items(), key=lambda x: x[1])
 
@@ -171,6 +180,7 @@ def parse_codebase(
         exported_names  = extract_exports(source_code, canonical)
         callsites       = extract_callsites(source_code, canonical)
         ref_usages      = extract_ref_usages(source_code, canonical)
+        call_arguments  = extract_call_arguments(source_code, canonical)
 
         file_data[canonical] = {
             "id":          file_id,
@@ -178,6 +188,7 @@ def parse_codebase(
             "exports":     exported_names,
             "callsites":   callsites,
             "ref_usages":  ref_usages,
+            "call_args":   call_arguments,
             "source_code": source_code,
         }
 
@@ -234,6 +245,11 @@ def parse_codebase(
                 target_canonical = resolved
                 edge_type, edge_weight = _classify_edge(canonical, target_canonical)
                 resolved_binding = binding or (next(iter(all_names_for_imp), "") if all_names_for_imp else "")
+
+                per_file = binding_targets.setdefault(canonical, {})
+                for name in {resolved_binding, *all_names_for_imp}:
+                    if name:
+                        per_file[name] = resolved
                 target_line = target_exports.get(called_names[0]) if called_names else target_exports.get(resolved_binding)
                 edges.append({
                     "source_id":      file_id,
@@ -271,5 +287,12 @@ def parse_codebase(
     # ------------------------------------------------------------------
     edges = inject_naming_convention_edges(edges, nodes, registry)
     edges = inject_routing_convention_edges(edges, nodes, registry)
+
+    # ------------------------------------------------------------------
+    # Contract edges — HTTP + event links that no import expresses
+    # ------------------------------------------------------------------
+    file_calls = {c: d["call_args"] for c, d in file_data.items() if d["call_args"]}
+    edges = inject_contract_edges(edges, nodes, registry, file_calls, binding_targets)
+    edges = inject_state_edges(edges, registry)
 
     return nodes, edges, embeddings

@@ -80,6 +80,23 @@ Heuristic: target in `_SHARED_UI_DIR_HINTS` (`packages/ui/`, `components/ui/`, `
 
 `modules/naming_conventions.py` — pairs files with overlapping domain tokens (≥3 chars, not tier words) across ascending architectural tiers: route(0) → controller(1) → service(2) → repository(3) → model(4). Tier inferred from stem/parent dir via `_LAYER_TIERS`. Weight 0.4, `is_synthetic=True`, `edge_type=BELONGS_TO_DOMAIN`, `called_names=shared_tokens`.
 
+### Contract links (`modules/contracts.py`)
+
+Runtime connections made through a shared **string** rather than an import. Without these an Express `server.js` reaches ~80% of its repo while a Next.js `login/page.tsx` reaches 2 files — the UI is wired by the framework and by URLs, not by `import`.
+
+- `CALLS_API` — client HTTP call → route-handler file. Server route table from **(a)** Next.js convention (`app/api/**/route.ts` → URL, route groups `(x)` and parallel `@x` segments stripped; `pages/api/*`), and **(b)** Express `router.<verb>("/path")` prefixed by the mount resolved from `app.use("/api/auth", authRoutes)` — the identifier is matched against `binding_targets` (`{source file: {local binding: imported file}}`, built in `parse_codebase`). Client side is `fetch`/`axios.*`/`api.*` etc.; `_is_server_file` (external deps ∩ express/fastify/koa/hapi) disambiguates `app.get` as *definition* vs `axios.get` as *call*.
+- `EMITS_EVENT` — `emit/publish/trigger` → `on/once/addEventListener/subscribe`, joined on the event-name string. `_DOM_EVENTS` and bare lowercase single-word names are rejected, otherwise every component with an `onClick` would link to every other.
+
+`normalize_url` strips scheme+host, query, and hash, and collapses `:id` / `[id]` / `${id}` / numeric segments to `*`; `_urls_match` compares segment-wise with `*` as a single-segment wildcard.
+
+Both types are emitted at **weight 0.0**, `is_synthetic=True`, and are excluded from community detection (`_NON_STRUCTURAL_EDGE_TYPES`), from degree-based decisions (`_degrees_excluding_contracts`, used by `extract_shared_dependencies` / `prune_orchestrators` / role assignment), and from `cluster_analytics` cohesion and density. Adding them provably cannot move a file between clusters. RENDERS is deliberately **not** in `_CONTRACT_EDGE_TYPES` — it has always counted toward degree, and excluding it would change existing output. A pair that already has a real import edge is skipped; repeat matches on the same pair merge their labels into `called_names`.
+
+### Shared-state links (`modules/shared_state.py`)
+
+`PROVIDES_STATE` — React Context / store **provider → consumer**. Both sides import the same context module, so the import graph records `layout → auth-context` and `profile-page → auth-context` but nothing joining the two, even though the layout is what supplies the page its data at runtime.
+
+Needs no new parsing: among the real import edges into a module, a source whose `binding`/`called_names` match `(Provider|Context)$` provides, and one matching `^use[A-Z]` consumes. Requires **both** to be present, which is what keeps it from firing on ordinary components. Skips pairs that already have any edge — for a Next.js layout provider the routing-convention sibling edges usually already cover its own route children, so the edges that survive are the genuinely missing ones (a deep component consuming the context). Capped by `MAX_STATE_EDGES_PER_MODULE=150` per module, since the provider×consumer product is quadratic.
+
 `modules/routing_conventions.py` — Next.js App Router: convention stems (`page, layout, loading, error, not-found, default, template, route, global-error, global-not-found`) get bidirectional sibling edges within the same dir and a single `layout → segment-file` edge to the nearest ancestor layout (walk stops at first hit, not every ancestor). No-op if no entry-point stems exist in registry. Weight 0.4, `is_synthetic=True`.
 
 ## Phase 3 — Clustering (`modules/clustering.py`)
@@ -145,6 +162,15 @@ Schema v2.2, **flat relational** — no nested children, no duplicated nodes:
     "max_cluster_size": N,
     "detected_domains": ["AUTHENTICATION", "Inventory", "..."]
   },
+  "entry_points": [
+    {"file": "app/(dashboard)/page.tsx", "url": "/", "kind": "page|api|server",
+     "auth_state": "public|protected", "confidence": 0.9,
+     "evidence": ["layout.tsx imports components/auth/protected-route.tsx"],
+     "render_chain": ["app/layout.tsx", "app/(dashboard)/layout.tsx", "app/(dashboard)/page.tsx"],
+     "cluster_id": "c_0001", "domain": "Dashboard",
+     "reach_count": 209, "own_reach_count": 180, "reach_ratio": 0.83,
+     "is_landing": true}
+  ],
   "clusters": [
     {"id": "c_0001", "name": "...", "parent_cluster_id": null|"c_xxxx",
      "suggested_title": "...", "functional_summary": "...",
@@ -162,7 +188,7 @@ Schema v2.2, **flat relational** — no nested children, no duplicated nodes:
   ],
   "edges": [
     {"source": "<path>", "target": "<path>",
-     "type": "BELONGS_TO_DOMAIN|RENDERS|SEMANTIC_SIMILARITY",
+     "type": "BELONGS_TO_DOMAIN|RENDERS|SEMANTIC_SIMILARITY|CALLS_API|EMITS_EVENT|PROVIDES_STATE",
      "weight": 1.0, "binding": "...", "called_names": [...],
      "is_dead_import": false, "is_synthetic": false}
   ]
@@ -170,6 +196,20 @@ Schema v2.2, **flat relational** — no nested children, no duplicated nodes:
 ```
 
 `build_blueprint` assigns each node to its **most specific** (deepest) cluster by preferring child clusters when both a parent and a child list the same node.
+
+### Journey entry points (`modules/journeys.py`)
+
+`detect_entry_points(flat_nodes, flat_edges)` runs inside `build_blueprint` (flat_nodes already carry final `cluster_id`/`domain`, flat_edges use canonical paths) and emits a top-level `entry_points` array plus `project_metadata.journey_coverage`.
+
+Answers "what does a user see first?", which `execution_role: "ENTRY_POINT"` does **not** — that means "nothing imports me" and is ~35% of files (920/2654 in one repo: configs, tests, every un-imported leaf).
+
+- **Roots**: App Router `page`/`route` files (URL via pure path arithmetic — route groups `(x)` and parallel `@x` stripped, `[id]` → `:id`), plus a `server`/`app`/`index`/`main` file whose external deps include express/fastify/koa.
+- **`render_chain`**: ancestor layouts outermost-first, then the page. A page never imports its layouts (the framework composes them), so without this the tour skips the files that run first — including whichever layout holds the auth guard. On the A2E fixture this took coverage from 11/14 to 14/14. The frontend seeds its walk from the whole chain.
+- **Auth state**: `protected` iff an ancestor layout imports a module matching `_GUARD_RE` (`protected|auth-guard|require-auth|with-auth|private-route|authenticated|auth-check`) — verified on A2E: `app/(dashboard)/layout.tsx` imports `components/auth/protected-route.tsx`. Otherwise `public`, at reduced confidence (0.6) since absence of evidence is weaker than presence.
+- **`is_landing`**: the suggested start per auth state. **Not** the highest-reach root — for `public` an invite page reached more files than `/login` and would be the wrong answer, so public prefers a login-like URL, then shallowest depth; `protected` prefers shallowest depth (`/`).
+- **Two reach numbers**: `reach_count` (from the whole render chain — the tour's size) and `own_reach_count` (from the file alone). Ranking uses the latter, because every page shares the root layout's subtree and chain reach is near-identical across pages (209 for all of them in one repo).
+
+Traversal follows `BELONGS_TO_DOMAIN`/`RENDERS` **only when not synthetic**, plus all of `CALLS_API`/`EMITS_EVENT`/`PROVIDES_STATE`. `SEMANTIC_SIMILARITY` and convention edges are excluded so a tour never presents an invented hop as real.
 
 ### Paradigm detection (`_detect_paradigm`)
 
@@ -183,6 +223,7 @@ Reads `graph_blueprint.json` (string `id`s, `nodes[].cluster_id` linkage) and wr
 
 ## Key invariants / gotchas
 
+- `build_graph` must copy `is_synthetic` onto the graph — it previously did not, so every weight-0.4 convention edge from `naming_conventions` / `routing_conventions` arrived in the blueprint as `is_synthetic: false` and could not be filtered out (in one 251-node Next.js repo that made `app/global-error.tsx` look like it imported 24 files). On a duplicate-edge merge the flag is AND-ed: one real import makes the merged edge genuine.
 - `node_id`s in `embeddings` row indexing assume ids = positions (0..N-1 across full registry). The clustering helper comment at line 309–312 in `clustering.py` calls this out explicitly — a prior version misindexed whenever admin files existed.
 - Singleton absorption's `multi_centroids` snapshot is computed once; newly-promoted singletons aren't reflected (acceptable per inline comment).
 - Background tasks run in `run_in_executor` so the asyncio loop isn't blocked, but they still consume CPU in-process. `analysis_tasks` is in-memory only — replace with Redis/DB for multi-instance.
@@ -200,11 +241,14 @@ Reads `graph_blueprint.json` (string `id`s, `nodes[].cluster_id` linkage) and wr
 | `cluster_analytics.py` | `generate(blueprint_path)` → `cluster_analytics.json` next to blueprint |
 | `modules/ingestion.py` | `crawl`, `partition_registry`, `save_registry`/`load_registry`, `is_admin_file` regexes, `BLACKLISTED_DIRS` |
 | `modules/treesitter_setup.py` | Language objects (`_JS_LANG`/`_TS_LANG`/`_TSX_LANG`), query strings, per-language cached query accessors |
-| `modules/extractors.py` | `extract_imports[_treesitter|_regex]`, `extract_exports`, `extract_callsites`, `extract_ref_usages` |
+| `modules/extractors.py` | `extract_imports[_treesitter|_regex]`, `extract_exports`, `extract_callsites`, `extract_ref_usages`, `extract_call_arguments` (callee + string/identifier args, backs contract links) |
 | `modules/import_resolver.py` | JSONC-stripping tsconfig parser, `load_path_aliases` (scoped), `load_workspace_packages` (pnpm/yarn/npm), `resolve_import` (alias→relative→absolute→workspace→probe), binding regexes |
 | `modules/embeddings.py` | `preprocess_text` (comment+path text, keyword/symbol strip), `generate_embeddings` via `all-MiniLM-L6-v2` singleton |
 | `modules/naming_conventions.py` | Layer-tier inference + domain-token matching → synthetic `BELONGS_TO_DOMAIN` edges weight 0.4 |
 | `modules/routing_conventions.py` | Next.js App Router sibling + nearest-ancestor-layout synthetic edges weight 0.4 |
+| `modules/journeys.py` | `detect_entry_points` / `summarize_coverage` — route roots, render chains, auth-guard state, reach ranking |
+| `modules/shared_state.py` | `PROVIDES_STATE` provider->consumer edges joined via existing `binding`/`called_names`; weight 0.0, non-structural |
+| `modules/contracts.py` | String-keyed runtime links: `CALLS_API` (client fetch/axios → Next.js or Express route handler, with mount-prefix resolution) and `EMITS_EVENT` (emitter → listener); weight 0.0, non-structural |
 | `modules/clustering.py` | Two-pass hierarchical clustering, Leiden→Louvain→WCC fallback, god-file/shared-dep/orchestrator handling, embedding-cosine orphan recovery, `SEMANTIC_SIMILARITY` edge injection |
 | `modules/domain_detection.py` | Seeded label propagation (dep+name file seeds → NumPy label spreading → purity-gated cluster aggregation → emergent dominant-token fallback), own stopword tokenizer, canonical taxonomy |
 | `modules/summarizer.py` | `LLMProvider` protocol, `OpenAIProvider`/`OllamaProvider`, `get_llm_provider`, `label_clusters`, `_auto_title` |

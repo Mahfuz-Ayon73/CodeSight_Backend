@@ -26,6 +26,7 @@ from modules.parser import parse_codebase, detect_module_system
 from modules.clustering import cluster_codebase
 from modules.domain_detection import detect_domains
 from modules.summarizer import label_clusters, get_llm_provider
+from modules.journeys import detect_entry_points, summarize_coverage
 from cluster_analytics import generate as generate_analytics
 
 
@@ -131,6 +132,18 @@ def build_blueprint(
         if c.get("domain") and c.get("domain_type") in ("CANONICAL", "EMERGENT")
     })
 
+    # Journey roots — computed here because flat_nodes already carry their
+    # final cluster_id and domain, and flat_edges are in canonical-path form.
+    entry_points = detect_entry_points(flat_nodes, flat_edges)
+    journey_coverage = summarize_coverage(flat_nodes, flat_edges, entry_points)
+    if entry_points:
+        landing = [e for e in entry_points if e.get("is_landing")]
+        print(f"[Journeys] {len(entry_points)} entry point(s), "
+              f"{len(landing)} landing; {journey_coverage['reached']}/"
+              f"{journey_coverage['total']} files reachable.")
+    else:
+        print("[Journeys] No route entry points detected for this paradigm.")
+
     return {
         "schema_version": "2.2",
         "project_id": project_id,
@@ -141,7 +154,9 @@ def build_blueprint(
             "total_clusters":      len(flat_clusters),
             "max_cluster_size":    max((len(c.get("node_ids", [])) for c in clusters), default=0),
             "detected_domains":    detected_domains,
+            "journey_coverage":    journey_coverage,
         },
+        "entry_points": entry_points,
         "clusters": flat_clusters,
         "nodes":    flat_nodes,
         "edges":    flat_edges,
