@@ -318,7 +318,7 @@ if __name__ == "__main__":
     optional_deps = ["leidenalg", "igraph", "hdbscan"]
     for dep in optional_deps:
         result = _check_import(dep)
-        status = "✓" if result["available"] else "✗ (fallback enabled)"
+        status = "OK" if result["available"] else "MISSING (fallback enabled)"
         print(f"Optional dependency {dep}: {status}")
     
     print("\nAll systems ready. Starting server...\n")
