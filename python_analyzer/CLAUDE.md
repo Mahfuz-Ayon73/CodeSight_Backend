@@ -144,9 +144,13 @@ Two-pass hierarchical; guarantees every leaf has 1–`MAX_CLUSTER_SIZE=30` files
 
 ## Phase 4 — Labeling (`modules/summarizer.py`)
 
-For each cluster: top 5 nodes by `centrality_score`, build `PROMPT_TEMPLATE` prompt, call `LLMProvider.complete(prompt)`. `OpenAIProvider` (gpt-4o-mini, temp 0.2, max_tokens 200) or `OllamaProvider` (urllib POST to `/api/generate`). Response is regex-extracted for `{"title", "summary"}`. Failure → `_auto_title`: most-common parent dir name + " Module".
+For each cluster: top 5 nodes by `centrality_score`. Clusters are labeled in batches of `LABEL_BATCH_SIZE=8` — one `BATCH_PROMPT_TEMPLATE` prompt covers up to 8 clusters' file lists in a single `LLMProvider.complete(prompt)` call, response is a JSON array `{"id","title","summary"}` matched back by cluster id (`_parse_batch_response`). This keeps total API calls low regardless of repo size (20 clusters = 3 calls), which is what actually lets every cluster get a real name under free-tier rate limits instead of only the first few before quota runs out. A 2s sleep separates batches as a per-minute-limit safety margin.
 
-LLM is optional; `get_llm_provider()` returns `None` for unconfigured/missing key, and the system always falls back.
+Providers: `OpenAIProvider` (gpt-4o-mini, temp 0.2), `GeminiProvider` (urllib POST to `generativelanguage.googleapis.com`, `maxOutputTokens=4000` + `responseMimeType=application/json` since flash models spend part of the budget on internal reasoning before visible output; retries once on HTTP 429 using the API's own `retryDelay`), `OllamaProvider` (urllib POST to `/api/generate`).
+
+Any cluster the LLM doesn't cover (no LLM configured, a batch call raised, or the response omitted that id) falls back to `_auto_title`: most-common parent dir name + " Module", skipping root-level files (empty parent dir name) so it can't produce a blank `" Module"` title; falls back further to the cluster id itself if no directory names remain.
+
+LLM is optional; `get_llm_provider()` returns `None` for unconfigured/missing key, and the system always falls back — this must hold for every LLM-backed feature (naming and domain validation), not just on missing config but on any runtime failure (rate limit, network error, bad response), so a failing LLM call never breaks the analysis run.
 
 ## Phase 5 — Output (`analyzer.build_blueprint`)
 

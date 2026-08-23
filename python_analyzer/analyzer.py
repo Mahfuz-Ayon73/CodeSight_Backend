@@ -24,7 +24,7 @@ from typing import Callable, Optional
 from modules.ingestion import crawl, save_registry, partition_registry
 from modules.parser import parse_codebase, detect_module_system
 from modules.clustering import cluster_codebase
-from modules.domain_detection import detect_domains
+from modules.domain_detection import detect_domains, validate_domains
 from modules.summarizer import label_clusters, get_llm_provider
 from modules.journeys import detect_entry_points, summarize_coverage
 from cluster_analytics import generate as generate_analytics
@@ -125,6 +125,9 @@ def build_blueprint(
             "domain_type":       cluster.get("domain_type", "UNCLASSIFIED"),
             "domain_confidence": cluster.get("domain_confidence", 0.0),
             "domain_evidence":   cluster.get("domain_evidence", []),
+            "domain_llm_validated":  cluster.get("domain_llm_validated"),
+            "domain_llm_confidence": cluster.get("domain_llm_confidence"),
+            "domain_llm_reason":     cluster.get("domain_llm_reason"),
         })
 
     detected_domains = sorted({
@@ -293,9 +296,14 @@ def run_analysis(
     _report("domain_detection", "Detecting functional domains...")
     clusters = detect_domains(clusters, nodes, app_edges)
 
+    llm = get_llm_provider()
+
+    # Phase 3.6: LLM sanity pass over the algorithmic domain assignments (no-op without an LLM configured)
+    _report("domain_validation", "Validating detected domains with LLM...")
+    clusters = validate_domains(clusters, nodes, llm)
+
     # Phase 4: Label
     _report("labeling", "Labeling clusters with AI summaries...")
-    llm = get_llm_provider()
     clusters = label_clusters(clusters, nodes, llm)
 
     # Build and write blueprint

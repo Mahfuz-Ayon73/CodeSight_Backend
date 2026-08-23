@@ -564,3 +564,90 @@ def detect_domains(clusters: list[dict], nodes: list[dict], edges: list[dict]) -
           f"{counts.get('UNCLASSIFIED', 0)} unclassified "
           f"across {len(clusters)} clusters")
     return clusters
+
+
+# ---------------------------------------------------------------------------
+# LLM validation (optional) — sanity-checks the algorithmic domain assignments
+# ---------------------------------------------------------------------------
+
+_VALIDATION_PROMPT = """You are reviewing an automated domain classification for a cluster \
+of files in a software codebase.
+
+Assigned domain: {domain}
+
+Files in this cluster:
+{file_list}
+
+Does "{domain}" accurately describe the shared functional purpose of these files?
+Respond ONLY in this exact JSON format:
+{{"valid": true|false, "confidence": <0.0-1.0>, "reason": "<one short sentence>"}}"""
+
+
+def _build_validation_prompt(domain: str, members: list[dict]) -> str:
+    top = sorted(members, key=lambda n: n.get("centrality_score", 0), reverse=True)[:5]
+    file_list = "\n".join(
+        f"- {n['canonical_path']}: {n.get('text_summary', '')[:100]}" for n in top
+    )
+    return _VALIDATION_PROMPT.format(domain=domain, file_list=file_list)
+
+
+def _parse_validation_response(response: str) -> tuple[bool, float, str] | None:
+    try:
+        import json
+        match = re.search(r"\{.*\}", response, re.DOTALL)
+        if not match:
+            return None
+        data = json.loads(match.group())
+        return bool(data["valid"]), float(data.get("confidence", 0.5)), str(data.get("reason", ""))
+    except Exception:
+        return None
+
+
+def validate_domains(clusters: list[dict], nodes: list[dict], llm) -> list[dict]:
+    """
+    Optional LLM sanity pass over the algorithmic domain assignments from
+    detect_domains(), run only on CANONICAL/EMERGENT clusters (INFRASTRUCTURE
+    and UNCLASSIFIED have nothing to confirm).
+
+    Never overrides `domain` / `domain_type` / `domain_confidence` -- those stay
+    purely algorithmic and reproducible with no LLM configured. Adds
+    `domain_llm_validated` / `domain_llm_confidence` / `domain_llm_reason`
+    alongside them so a human (or the frontend) can see where the LLM disagreed
+    with the label-propagation result, without the LLM being able to silently
+    overwrite it. `llm=None` (no provider configured) is a no-op.
+    """
+    if llm is None:
+        return clusters
+
+    node_by_id = {n["id"]: n for n in nodes}
+    checked = agreed = 0
+
+    for cluster in clusters:
+        if cluster.get("domain_type") not in ("CANONICAL", "EMERGENT"):
+            continue
+        members = [node_by_id[nid] for nid in cluster.get("node_ids", []) if nid in node_by_id]
+        if not members:
+            continue
+
+        try:
+            prompt = _build_validation_prompt(cluster["domain"], members)
+            response = llm.complete(prompt)
+            parsed = _parse_validation_response(response)
+        except Exception as e:
+            print(f"[DomainValidation] LLM check failed for {cluster.get('id')}: {e}")
+            continue
+
+        if parsed is None:
+            print(f"[DomainValidation] Unparseable LLM response for {cluster.get('id')}")
+            continue
+
+        valid, confidence, reason = parsed
+        cluster["domain_llm_validated"] = valid
+        cluster["domain_llm_confidence"] = round(confidence, 2)
+        cluster["domain_llm_reason"] = reason
+        checked += 1
+        agreed += valid
+
+    if checked:
+        print(f"[DomainValidation] {agreed}/{checked} cluster domains confirmed by LLM")
+    return clusters
