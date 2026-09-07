@@ -6,6 +6,7 @@ import com.codesight.codesight.app.project.dto.GithubUploadStartedDto;
 import com.codesight.codesight.app.project.dto.ProjectRequestDto;
 import com.codesight.codesight.app.project.dto.ProjectResponseDto;
 import com.codesight.codesight.app.project.dto.ProjectUpdateRequestDto;
+import com.codesight.codesight.app.project.dto.ValidateDomainsResponseDto;
 import com.codesight.codesight.app.project.services.ChunkedUploadService;
 import com.codesight.codesight.app.project.services.CloneProgressStore;
 import com.codesight.codesight.app.project.services.FileContentService;
@@ -174,6 +175,18 @@ public class ProjectController {
         return ResponseEntity.ok(
                 blueprintService.getBlueprint(organizationId, projectId, currentUser.getId())
         );
+    }
+
+    @PostMapping("/{projectId}/validate-domains")
+    public ResponseEntity<ValidateDomainsResponseDto> validateDomains(
+            @PathVariable UUID organizationId,
+            @PathVariable UUID projectId,
+            @AuthenticationPrincipal UserModel currentUser
+    ) {
+        // Authorizes the same way triggerAnalysis does -- getProject throws if the
+        // caller isn't a member of this org/project.
+        projectService.getProject(organizationId, projectId, currentUser.getId());
+        return ResponseEntity.ok(pythonAnalysisService.validateDomains(organizationId, projectId));
     }
 
     @GetMapping("/{projectId}/file-content")

@@ -129,7 +129,9 @@ _DOMAIN_LEXICONS: dict[str, frozenset[str]] = {
     "REGISTRATION": frozenset({
         "register", "registration", "signup", "onboarding", "onboard",
         "verification", "verify", "activation", "activate",
-        "confirmation", "confirm",
+        "confirmation",
+        # NOT "confirm" alone -- too generic (matched Excalidraw's
+        # OverwriteConfirm save dialog, which has nothing to do with signup).
     }),
     "PAYMENTS": frozenset({
         "payment", "payments", "payout", "billing", "invoice", "invoices",
@@ -187,6 +189,27 @@ _STRUCTURAL_STOPWORDS = frozenset({
     "template", "templates", "validator", "validators",
     "swagger", "annotation", "annotations",
     "old", "new", "js", "ts", "jsx", "tsx", "mjs", "cjs",
+    # UI widget-type nouns: describe HOW a feature is presented, not WHAT
+    # business purpose it serves, so they recur across unrelated features in
+    # any component-library-heavy repo (Excalidraw: TTDDialog, ConfirmDialog,
+    # ExportDialog, HelpDialog all matched "dialog" and got merged into one
+    # fake "Dialog" domain covering 41/44 files in one cluster).
+    "dialog", "dialogs", "modal", "modals", "menu", "menus",
+    "sidebar", "sidebars", "toolbar", "toolbars", "panel", "panels",
+    "tab", "tabs", "tooltip", "tooltips", "dropdown", "dropdowns",
+    "popup", "popups", "popover", "popovers", "button", "buttons",
+    "radio", "picker", "pickers", "icon", "icons", "card", "cards",
+    "badge", "badges", "spinner", "spinners", "loader", "loaders",
+    "banner", "banners",
+    # Generic programming-pattern nouns: universal to any codebase, carry no
+    # domain meaning by themselves.
+    "context", "contexts", "event", "events", "action", "actions",
+    "client", "clients", "provider", "providers", "reducer", "reducers",
+    "store", "stores", "state", "states", "callback", "callbacks",
+    "listener", "listeners",
+    # Non-business scaffolding directories.
+    "docs", "doc", "example", "examples", "demo", "demos",
+    "welcome", "playground", "sandbox",
 })
 
 _TOKEN_RE = re.compile(r"[a-zA-Z][a-zA-Z0-9]*")
@@ -567,87 +590,148 @@ def detect_domains(clusters: list[dict], nodes: list[dict], edges: list[dict]) -
 
 
 # ---------------------------------------------------------------------------
-# LLM validation (optional) — sanity-checks the algorithmic domain assignments
+# LLM validation (optional) — sanity-checks the algorithmic domain assignments,
+# and in the same round-trip asks for a replacement name wherever a domain
+# looks wrong. Originally two sequential batched passes (validate, then a
+# second suggest pass over whatever came out weak); merged into one because
+# two full passes each paying a network round-trip + inter-batch throttle
+# doubled wall-clock time on repos with many CANONICAL/EMERGENT clusters for
+# no benefit -- the LLM can judge validity and propose a better name from the
+# same file list in a single call.
+#
+# Batches several clusters into one prompt (mirrors summarizer.label_clusters'
+# LABEL_BATCH_SIZE) rather than firing one LLM call per cluster -- a repo like
+# Excalidraw can have 15+ such clusters, and free-tier per-minute rate limits
+# make one-call-per-cluster the wrong default.
 # ---------------------------------------------------------------------------
 
-_VALIDATION_PROMPT = """You are reviewing an automated domain classification for a cluster \
-of files in a software codebase.
+VALIDATION_BATCH_SIZE = 8
 
-Assigned domain: {domain}
+_VALIDATION_BATCH_PROMPT = """You are reviewing automated domain classifications for several \
+clusters of files in a software codebase.
 
-Files in this cluster:
-{file_list}
+{clusters_block}
 
-Does "{domain}" accurately describe the shared functional purpose of these files?
-Respond ONLY in this exact JSON format:
-{{"valid": true|false, "confidence": <0.0-1.0>, "reason": "<one short sentence>"}}"""
+For each cluster, does its assigned domain accurately describe the shared functional purpose of \
+its files? If it does not (or the domain is right but you are not confident), also propose a \
+short business-domain name (2-3 words, Title Case, e.g. "Canvas Rendering" or "Shape Export") \
+grounded in what the files actually do. Avoid naming it after a UI widget type (e.g. "Dialog", \
+"Button", "Menu") or a generic programming pattern (e.g. "Context", "Event", "Action") -- name \
+the underlying feature area. Omit "suggested_domain" when the assigned domain is already accurate \
+and you're confident.
+
+Respond ONLY as a JSON array, exactly one object per cluster listed above, in this format:
+[{{"id": "<cluster id>", "valid": true|false, "confidence": <0.0-1.0>, "reason": "<one short sentence>", \
+"suggested_domain": "<name, or omit this key entirely if the assigned domain is fine>"}}]"""
 
 
-def _build_validation_prompt(domain: str, members: list[dict]) -> str:
+def _top_file_list(members: list[dict]) -> str:
     top = sorted(members, key=lambda n: n.get("centrality_score", 0), reverse=True)[:5]
-    file_list = "\n".join(
-        f"- {n['canonical_path']}: {n.get('text_summary', '')[:100]}" for n in top
-    )
-    return _VALIDATION_PROMPT.format(domain=domain, file_list=file_list)
+    return "\n".join(f"  - {n['canonical_path']}: {n.get('text_summary', '')[:100]}" for n in top)
 
 
-def _parse_validation_response(response: str) -> tuple[bool, float, str] | None:
+def _build_validation_batch_prompt(batch: list[tuple[str, str, list[dict]]]) -> str:
+    blocks = [
+        f'Cluster id "{cid}" (assigned domain: "{domain}"):\n{_top_file_list(members)}'
+        for cid, domain, members in batch
+    ]
+    return _VALIDATION_BATCH_PROMPT.format(clusters_block="\n\n".join(blocks))
+
+
+def _parse_validation_batch_response(response: str) -> dict[str, tuple[bool, float, str, str | None]]:
     try:
         import json
-        match = re.search(r"\{.*\}", response, re.DOTALL)
+        match = re.search(r"\[.*\]", response, re.DOTALL)
         if not match:
-            return None
-        data = json.loads(match.group())
-        return bool(data["valid"]), float(data.get("confidence", 0.5)), str(data.get("reason", ""))
+            return {}
+        result = {}
+        for item in json.loads(match.group()):
+            cid = item.get("id")
+            if cid and "valid" in item:
+                suggested = item.get("suggested_domain")
+                result[cid] = (
+                    bool(item["valid"]),
+                    float(item.get("confidence", 0.5)),
+                    str(item.get("reason", "")),
+                    str(suggested) if suggested else None,
+                )
+        return result
     except Exception:
-        return None
+        return {}
+
+
+def _clusters_with_members(clusters: list[dict], node_by_id: dict) -> list[tuple[str, str, list[dict]]]:
+    """CANONICAL/EMERGENT clusters with resolvable member files, as (id, domain, members) tuples."""
+    out = []
+    for cluster in clusters:
+        if cluster.get("domain_type") not in ("CANONICAL", "EMERGENT"):
+            continue
+        members = [node_by_id[nid] for nid in cluster.get("node_ids", []) if nid in node_by_id]
+        if members:
+            out.append((cluster["id"], cluster.get("domain"), members))
+    return out
 
 
 def validate_domains(clusters: list[dict], nodes: list[dict], llm) -> list[dict]:
     """
     Optional LLM sanity pass over the algorithmic domain assignments from
     detect_domains(), run only on CANONICAL/EMERGENT clusters (INFRASTRUCTURE
-    and UNCLASSIFIED have nothing to confirm).
+    and UNCLASSIFIED have nothing to confirm). Batched VALIDATION_BATCH_SIZE
+    clusters per call; when a domain looks wrong the same call also proposes a
+    replacement name, so there's no separate suggestion round-trip.
 
     Never overrides `domain` / `domain_type` / `domain_confidence` -- those stay
     purely algorithmic and reproducible with no LLM configured. Adds
-    `domain_llm_validated` / `domain_llm_confidence` / `domain_llm_reason`
-    alongside them so a human (or the frontend) can see where the LLM disagreed
-    with the label-propagation result, without the LLM being able to silently
-    overwrite it. `llm=None` (no provider configured) is a no-op.
+    `domain_llm_validated` / `domain_llm_confidence` / `domain_llm_reason` (and
+    `domain_llm_suggested_name` / `domain_llm_suggested_reason` when the LLM
+    proposed one) alongside them so a human (or the frontend) can see where
+    the LLM disagreed, without the LLM being able to silently overwrite it.
+    `llm=None` (no provider configured) is a no-op.
     """
     if llm is None:
         return clusters
 
     node_by_id = {n["id"]: n for n in nodes}
-    checked = agreed = 0
+    batchable = _clusters_with_members(clusters, node_by_id)
+    if not batchable:
+        return clusters
 
-    for cluster in clusters:
-        if cluster.get("domain_type") not in ("CANONICAL", "EMERGENT"):
-            continue
-        members = [node_by_id[nid] for nid in cluster.get("node_ids", []) if nid in node_by_id]
-        if not members:
-            continue
-
+    import time
+    validated: dict[str, tuple[bool, float, str, str | None]] = {}
+    for i in range(0, len(batchable), VALIDATION_BATCH_SIZE):
+        batch = batchable[i:i + VALIDATION_BATCH_SIZE]
         try:
-            prompt = _build_validation_prompt(cluster["domain"], members)
-            response = llm.complete(prompt)
-            parsed = _parse_validation_response(response)
+            response = llm.complete(_build_validation_batch_prompt(batch))
+            validated.update(_parse_validation_batch_response(response))
         except Exception as e:
-            print(f"[DomainValidation] LLM check failed for {cluster.get('id')}: {e}")
-            continue
+            remaining = len(batchable) - i - len(batch)
+            print(f"[DomainValidation] LLM batch failed for {[cid for cid, _, _ in batch]}: {e}")
+            # Already paid the provider's own retry (e.g. Gemini's 429 retry, up to
+            # ~20s) once for this batch. If it still failed, that's quota/network for
+            # the whole run, not this batch -- stop rather than pay that cost again
+            # for every remaining batch. Unvalidated clusters just keep their
+            # algorithmic domain with no domain_llm_* fields, which is a valid state.
+            if remaining:
+                print(f"[DomainValidation] Skipping validation for {remaining} remaining cluster(s)")
+            break
+        if i + VALIDATION_BATCH_SIZE < len(batchable):
+            time.sleep(2)  # stay well under the free-tier per-minute cap
 
-        if parsed is None:
-            print(f"[DomainValidation] Unparseable LLM response for {cluster.get('id')}")
+    agreed = suggested_count = 0
+    for cluster in clusters:
+        if cluster["id"] not in validated:
             continue
-
-        valid, confidence, reason = parsed
+        valid, confidence, reason, suggested_domain = validated[cluster["id"]]
         cluster["domain_llm_validated"] = valid
         cluster["domain_llm_confidence"] = round(confidence, 2)
         cluster["domain_llm_reason"] = reason
-        checked += 1
         agreed += valid
+        if suggested_domain:
+            cluster["domain_llm_suggested_name"] = suggested_domain
+            cluster["domain_llm_suggested_reason"] = reason
+            suggested_count += 1
 
-    if checked:
-        print(f"[DomainValidation] {agreed}/{checked} cluster domains confirmed by LLM")
+    if validated:
+        print(f"[DomainValidation] {agreed}/{len(validated)} cluster domains confirmed by LLM, "
+              f"{suggested_count} replacement name(s) proposed")
     return clusters

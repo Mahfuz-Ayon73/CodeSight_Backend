@@ -298,9 +298,11 @@ def run_analysis(
 
     llm = get_llm_provider()
 
-    # Phase 3.6: LLM sanity pass over the algorithmic domain assignments (no-op without an LLM configured)
-    _report("domain_validation", "Validating detected domains with LLM...")
-    clusters = validate_domains(clusters, nodes, llm)
+    # LLM domain validation is intentionally NOT run here. It used to be an inline
+    # phase, but that made every analysis pay for however many CANONICAL/EMERGENT
+    # clusters exist before results could be shown at all. It's now a separate,
+    # on-demand pass (see validate_domains_for_blueprint below) triggered by the
+    # user from the finished result instead of blocking it.
 
     # Phase 4: Label
     _report("labeling", "Labeling clusters with AI summaries...")
@@ -338,6 +340,72 @@ def run_analysis(
     _report("done", "Analysis complete")
 
     return str(blueprint_path)
+
+
+# ---------------------------------------------------------------------------
+# On-demand LLM domain validation — deliberately NOT part of run_analysis.
+# Triggered by the user after the analysis result is already showing, rather
+# than adding an LLM-dependent phase to the critical path of every analysis.
+# ---------------------------------------------------------------------------
+
+def validate_domains_for_blueprint(blueprint_path: str) -> dict:
+    """
+    Loads an already-written graph_blueprint.json, runs the LLM domain
+    validation/suggestion pass over its CANONICAL/EMERGENT clusters, merges
+    the domain_llm_* fields back into the file, and rewrites it in place.
+
+    The flat blueprint schema stores cluster membership as nodes[].cluster_id
+    (a foreign key), but validate_domains() expects the pre-flatten shape
+    (clusters[].node_ids) that build_blueprint had internally -- so this
+    reconstructs node_ids per cluster before calling it, and strips it back
+    out before writing, to keep the on-disk schema unchanged.
+
+    Returns summary counts for the API response; raises if no blueprint
+    exists at that path or the file is unreadable.
+    """
+    path = Path(blueprint_path)
+    with open(path, "r", encoding="utf-8") as f:
+        blueprint = json.load(f)
+
+    nodes = blueprint.get("nodes", [])
+    clusters = blueprint.get("clusters", [])
+
+    members_by_cluster: dict[str, list[str]] = {}
+    for n in nodes:
+        members_by_cluster.setdefault(n["cluster_id"], []).append(n["id"])
+    for c in clusters:
+        c["node_ids"] = members_by_cluster.get(c["id"], [])
+
+    llm = get_llm_provider()
+    if llm is None:
+        return {
+            "llm_configured": False,
+            "clusters_checked": 0,
+            "clusters_confirmed": 0,
+            "clusters_with_suggestions": 0,
+        }
+
+    clusters = validate_domains(clusters, nodes, llm)
+
+    checked = confirmed = suggested = 0
+    for c in clusters:
+        c.pop("node_ids", None)  # internal-only; not part of the flat schema on disk
+        if "domain_llm_validated" in c:
+            checked += 1
+            confirmed += bool(c["domain_llm_validated"])
+        if c.get("domain_llm_suggested_name"):
+            suggested += 1
+
+    blueprint["clusters"] = clusters
+    with open(path, "w", encoding="utf-8") as f:
+        json.dump(blueprint, f, indent=2)
+
+    return {
+        "llm_configured": True,
+        "clusters_checked": checked,
+        "clusters_confirmed": confirmed,
+        "clusters_with_suggestions": suggested,
+    }
 
 
 if __name__ == "__main__":

@@ -284,7 +284,16 @@ def label_clusters(
                 labeled.update(_parse_batch_response(response))
             except Exception as e:
                 ids = [cid for cid, _ in batch]
+                remaining = len(batchable) - i - len(batch)
                 print(f"[WARN] LLM batch labeling failed for {ids}: {e}")
+                # A failure here already paid the provider's own retry (e.g. Gemini's
+                # 429 retry, up to ~20s). If it still failed, quota/network is down for
+                # this run, not just this batch -- retrying every remaining batch would
+                # each pay that same cost again for no benefit. Stop and let the rest
+                # fall back to _auto_title immediately.
+                if remaining:
+                    print(f"[WARN] Skipping LLM labeling for {remaining} remaining cluster(s); using fallback names")
+                break
             if i + LABEL_BATCH_SIZE < len(batchable):
                 time.sleep(2)  # stay well under the free-tier per-minute cap
 

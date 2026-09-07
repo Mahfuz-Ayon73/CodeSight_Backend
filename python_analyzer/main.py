@@ -15,7 +15,7 @@ from fastapi import FastAPI, HTTPException, BackgroundTasks
 from pydantic import BaseModel, Field
 import uvicorn
 
-from analyzer import run_analysis
+from analyzer import run_analysis, validate_domains_for_blueprint
 
 
 # ---------------------------------------------------------------------------
@@ -41,6 +41,19 @@ class HealthResponse(BaseModel):
     status: str
     version: str
     dependencies: dict
+
+
+class ValidateDomainsRequest(BaseModel):
+    output_dir: str = Field(..., description="Directory containing an already-written graph_blueprint.json")
+
+
+class ValidateDomainsResponse(BaseModel):
+    success: bool
+    llm_configured: bool = False
+    clusters_checked: int = 0
+    clusters_confirmed: int = 0
+    clusters_with_suggestions: int = 0
+    error_message: Optional[str] = None
 
 
 # ---------------------------------------------------------------------------
@@ -212,6 +225,32 @@ async def analyze_sync(request: AnalysisRequest):
             project_id=request.project_id,
             error_message=str(e),
         )
+
+
+@app.post("/analyze/validate-domains", response_model=ValidateDomainsResponse)
+async def validate_domains_endpoint(request: ValidateDomainsRequest):
+    """
+    On-demand LLM domain validation over an already-completed analysis.
+    Deliberately separate from /analyze[/sync] -- domain validation used to
+    run inline and could add minutes to every analysis; now the caller
+    (Spring, on a user button click) triggers it explicitly once the main
+    result is already showing.
+    """
+    blueprint_path = Path(request.output_dir) / "graph_blueprint.json"
+    if not blueprint_path.exists():
+        raise HTTPException(
+            status_code=404,
+            detail=f"No analysis blueprint found at {blueprint_path}"
+        )
+
+    try:
+        loop = asyncio.get_event_loop()
+        result = await loop.run_in_executor(
+            None, functools.partial(validate_domains_for_blueprint, str(blueprint_path))
+        )
+        return ValidateDomainsResponse(success=True, **result)
+    except Exception as e:
+        return ValidateDomainsResponse(success=False, error_message=str(e))
 
 
 # ---------------------------------------------------------------------------

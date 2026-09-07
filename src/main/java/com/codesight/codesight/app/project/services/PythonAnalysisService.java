@@ -3,6 +3,8 @@ package com.codesight.codesight.app.project.services;
 import com.codesight.codesight.app.project.dto.AnalysisRequestDto;
 import com.codesight.codesight.app.project.dto.AnalysisResponseDto;
 import com.codesight.codesight.app.project.dto.AnalysisStatusResponseDto;
+import com.codesight.codesight.app.project.dto.ValidateDomainsRequestDto;
+import com.codesight.codesight.app.project.dto.ValidateDomainsResponseDto;
 import com.codesight.codesight.app.project.model.AnalysisStatus;
 import com.codesight.codesight.app.project.model.ProjectModel;
 import com.codesight.codesight.app.project.repository.ProjectRepository;
@@ -149,6 +151,44 @@ public class PythonAnalysisService {
         } catch (Exception e) {
             log.warn("Python analyzer health check failed: {}", e.getMessage());
             return false;
+        }
+    }
+
+    /**
+     * On-demand LLM domain validation for an already-completed analysis. Deliberately
+     * not part of {@link #triggerAnalysisAsync} / {@link #triggerAnalysisSync} -- domain
+     * validation used to run inline as part of every analysis and could add minutes to
+     * it; it's now triggered explicitly by the user (a button on the finished result)
+     * instead of sitting on the critical path of every run.
+     */
+    public ValidateDomainsResponseDto validateDomains(UUID organizationId, UUID projectId) {
+        Path outputDir = Paths.get(analysisOutputDir)
+                .resolve(organizationId.toString())
+                .resolve(projectId.toString());
+
+        ValidateDomainsRequestDto request = new ValidateDomainsRequestDto();
+        request.setOutputDir(outputDir.toString());
+
+        HttpHeaders headers = new HttpHeaders();
+        headers.setContentType(MediaType.APPLICATION_JSON);
+        HttpEntity<ValidateDomainsRequestDto> httpEntity = new HttpEntity<>(request, headers);
+
+        try {
+            ResponseEntity<ValidateDomainsResponseDto> response = restTemplate.postForEntity(
+                pythonAnalyzerBaseUrl + "/analyze/validate-domains",
+                httpEntity,
+                ValidateDomainsResponseDto.class
+            );
+            if (response.getBody() != null) {
+                return response.getBody();
+            }
+            throw new RuntimeException("Empty response from Python analyzer");
+        } catch (Exception e) {
+            log.error("Domain validation failed for project {}", projectId, e);
+            ValidateDomainsResponseDto errorResponse = new ValidateDomainsResponseDto();
+            errorResponse.setSuccess(false);
+            errorResponse.setErrorMessage("Domain validation service error: " + e.getMessage());
+            return errorResponse;
         }
     }
 

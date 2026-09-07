@@ -197,5 +197,22 @@ public class BlueprintDto {
 
         @JsonProperty("domain_evidence")
         private List<String> domainEvidence;
+
+        /** Optional LLM sanity pass (see /validate-domains) -- advisory only, never overrides `domain`. */
+        @JsonProperty("domain_llm_validated")
+        private Boolean domainLlmValidated;
+
+        @JsonProperty("domain_llm_confidence")
+        private Double domainLlmConfidence;
+
+        @JsonProperty("domain_llm_reason")
+        private String domainLlmReason;
+
+        /** Only set for clusters the LLM flagged as weak -- a content-grounded replacement name. */
+        @JsonProperty("domain_llm_suggested_name")
+        private String domainLlmSuggestedName;
+
+        @JsonProperty("domain_llm_suggested_reason")
+        private String domainLlmSuggestedReason;
     }
 }
