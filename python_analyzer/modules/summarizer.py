@@ -2,7 +2,7 @@
 Phase 4: Semantic Labeling Engine
 - Compiles top-weighted files per cluster into an LLM prompt
 - LLM integration is optional — falls back to auto-generated names
-- Supports: OpenAI, Ollama (local)
+- Supports: OpenAI, Gemini, Ollama (local)
 - Add new providers by implementing the LLMProvider protocol
 """
 
@@ -45,6 +45,68 @@ class OpenAIProvider:
             max_tokens=200,
         )
         return response.choices[0].message.content.strip()
+
+
+# ---------------------------------------------------------------------------
+# Gemini Provider (Google AI Studio — free tier)
+# ---------------------------------------------------------------------------
+
+class GeminiProvider:
+    def __init__(self, api_key: str, model: str = "gemini-3.6-flash"):
+        self.api_key = api_key
+        self.model = model
+
+    def complete(self, prompt: str) -> str:
+        import urllib.request
+        import urllib.error
+        import json
+        import re
+        import time
+
+        url = (
+            f"https://generativelanguage.googleapis.com/v1beta/models/"
+            f"{self.model}:generateContent?key={self.api_key}"
+        )
+        payload = json.dumps({
+            "contents": [{"parts": [{"text": prompt}]}],
+            "generationConfig": {
+                "temperature": 0.2,
+                # Gemini's "flash" models spend part of the token budget on internal
+                # reasoning before the visible answer, and batched prompts (several
+                # clusters per call) need room for several title/summary pairs, so
+                # this has to be generous rather than tuned to one JSON object.
+                "maxOutputTokens": 4000,
+                "responseMimeType": "application/json",
+            },
+        }).encode("utf-8")
+
+        req = urllib.request.Request(
+            url,
+            data=payload,
+            headers={"Content-Type": "application/json"},
+        )
+
+        last_error = None
+        for attempt in range(2):  # one retry on a 429, since the API often reports its own retryDelay
+            try:
+                with urllib.request.urlopen(req, timeout=60) as resp:
+                    data = json.loads(resp.read())
+                return data["candidates"][0]["content"]["parts"][0]["text"].strip()
+            except urllib.error.HTTPError as e:
+                body = e.read().decode("utf-8", errors="replace")
+                last_error = RuntimeError(f"Gemini API error {e.code}: {body}")
+                if e.code == 429 and attempt == 0:
+                    delay_match = re.search(r'"retryDelay":\s*"(\d+)s"', body)
+                    delay = min(int(delay_match.group(1)), 20) if delay_match else 5
+                    # A 429 with a multi-second retryDelay is almost always the
+                    # per-minute cap, not the daily one (which reports the same
+                    # short delay but won't actually clear) -- retrying costs
+                    # little and recovers the common case.
+                    time.sleep(delay)
+                    continue
+                raise last_error from e
+
+        raise last_error
 
 
 # ---------------------------------------------------------------------------
@@ -96,6 +158,15 @@ def get_llm_provider() -> Optional[LLMProvider]:
         print(f"[Summarizer] Using OpenAI ({model})")
         return OpenAIProvider(api_key=api_key, model=model)
 
+    if provider_name == "gemini":
+        api_key = os.getenv("GEMINI_API_KEY", "")
+        if not api_key:
+            print("[Summarizer] LLM_PROVIDER=gemini but GEMINI_API_KEY is not set. Using fallback names.")
+            return None
+        model = os.getenv("GEMINI_MODEL", "gemini-3.6-flash")
+        print(f"[Summarizer] Using Gemini ({model})")
+        return GeminiProvider(api_key=api_key, model=model)
+
     if provider_name == "ollama":
         base_url = os.getenv("OLLAMA_BASE_URL", "http://localhost:11434")
         model = os.getenv("OLLAMA_MODEL", "llama3")
@@ -107,53 +178,70 @@ def get_llm_provider() -> Optional[LLMProvider]:
 
 
 # ---------------------------------------------------------------------------
-# Prompt template
+# Prompt template — batched across several clusters per call
 # ---------------------------------------------------------------------------
 
-PROMPT_TEMPLATE = """You are a software architecture analyst.
-Given the following source files from a JavaScript/TypeScript codebase cluster, provide:
+# Grouping clusters into one request keeps total API calls low regardless of
+# repo size (e.g. 10 clusters -> 2 calls instead of 10), which is what free-tier
+# rate limits (both per-minute and per-day) actually require to name every
+# cluster rather than only the first few before quota runs out.
+LABEL_BATCH_SIZE = 8
+
+BATCH_PROMPT_TEMPLATE = """You are a software architecture analyst.
+For each cluster of source files below, provide:
 1. A concise 3-word architectural title (e.g. "Secure Authentication Services")
 2. A one-sentence functional summary (max 20 words)
 
-Files in this cluster:
-{file_list}
+{clusters_block}
 
-Respond ONLY in this exact JSON format:
-{{"title": "<3 word title>", "summary": "<one sentence summary>"}}"""
-
-
-def _build_prompt(top_files: list[dict]) -> str:
-    file_list = "\n".join(
-        f"- {f['canonical_path']}: {f.get('text_summary', '')[:100]}"
-        for f in top_files
-    )
-    return PROMPT_TEMPLATE.format(file_list=file_list)
+Respond ONLY as a JSON array, exactly one object per cluster listed above, in this format:
+[{{"id": "<cluster id>", "title": "<3 word title>", "summary": "<one sentence summary>"}}]"""
 
 
-def _parse_llm_response(response: str) -> tuple[Optional[str], Optional[str]]:
-    """Extract title and summary from LLM JSON response."""
+def _build_batch_prompt(batch: list[tuple[str, list[dict]]]) -> str:
+    blocks = []
+    for cluster_id, top_files in batch:
+        file_list = "\n".join(
+            f"  - {f['canonical_path']}: {f.get('text_summary', '')[:100]}"
+            for f in top_files
+        )
+        blocks.append(f'Cluster id "{cluster_id}":\n{file_list}')
+    return BATCH_PROMPT_TEMPLATE.format(clusters_block="\n\n".join(blocks))
+
+
+def _parse_batch_response(response: str) -> dict[str, tuple[str, str]]:
+    """Extract {cluster_id: (title, summary)} from a batch LLM JSON array response."""
     try:
         import json
-        # Find JSON object in response (LLM may add extra text)
-        match = re.search(r"\{.*?\}", response, re.DOTALL)
-        if match:
-            data = json.loads(match.group())
-            return data.get("title"), data.get("summary")
+        match = re.search(r"\[.*\]", response, re.DOTALL)
+        if not match:
+            return {}
+        items = json.loads(match.group())
+        result = {}
+        for item in items:
+            cid, title, summary = item.get("id"), item.get("title"), item.get("summary")
+            if cid and title and summary:
+                result[cid] = (title, summary)
+        return result
     except Exception:
-        pass
-    return None, None
+        return {}
 
 
 def _auto_title(cluster_id: str, top_files: list[dict]) -> str:
     """Generate a readable fallback title from file paths."""
-    if not top_files:
-        return cluster_id.replace("_", " ").title()
-    # Use the most common directory name in the cluster
-    dirs = [Path(f["canonical_path"]).parent.name for f in top_files if f["canonical_path"] != "."]
-    if dirs:
-        from collections import Counter
-        most_common = Counter(dirs).most_common(1)[0][0]
-        return most_common.replace("-", " ").replace("_", " ").title() + " Module"
+    if top_files:
+        # Use the most common directory name in the cluster. Root-level files
+        # (e.g. Dockerfile) have an empty parent dir name, which must be
+        # filtered out here or the fallback silently produces " Module".
+        dirs = [
+            Path(f["canonical_path"]).parent.name
+            for f in top_files
+            if f["canonical_path"] != "." and Path(f["canonical_path"]).parent.name
+        ]
+        if dirs:
+            from collections import Counter
+            most_common = Counter(dirs).most_common(1)[0][0]
+            return most_common.replace("-", " ").replace("_", " ").title() + " Module"
     return cluster_id.replace("_", " ").title()
 
 
@@ -167,40 +255,63 @@ def label_clusters(
     llm: Optional[LLMProvider] = None,
 ) -> list[dict]:
     """
-    For each cluster, find top 5 nodes by centrality score
-    and generate a title + summary via LLM or fallback.
-    Uses new schema: cluster["id"] instead of cluster["cluster_id"].
+    For each cluster, find top 5 nodes by centrality score and generate a
+    title + summary. Clusters are sent to the LLM in batches (LABEL_BATCH_SIZE
+    per call) so every cluster gets a real name within free-tier rate limits,
+    not just the first few. Any cluster the LLM doesn't cover (no LLM
+    configured, a batch call failed, or the response omitted it) falls back
+    to an auto-generated title.
     """
     node_map = {n["id"]: n for n in nodes}
 
+    top_files_by_id: dict[str, list[dict]] = {}
     for cluster in clusters:
-        node_ids = cluster.get("node_ids", [])
-        cluster_label = cluster.get("id", "")
-
-        cluster_nodes = [node_map[nid] for nid in node_ids if nid in node_map]
-        top_files = sorted(
-            cluster_nodes,
-            key=lambda n: n.get("centrality_score", 0),
-            reverse=True,
+        cluster_nodes = [node_map[nid] for nid in cluster.get("node_ids", []) if nid in node_map]
+        top_files_by_id[cluster["id"]] = sorted(
+            cluster_nodes, key=lambda n: n.get("centrality_score", 0), reverse=True
         )[:5]
 
-        if llm is not None:
+    labeled: dict[str, tuple[str, str]] = {}
+
+    if llm is not None:
+        import time
+        batchable = [(c["id"], top_files_by_id[c["id"]]) for c in clusters if top_files_by_id[c["id"]]]
+        for i in range(0, len(batchable), LABEL_BATCH_SIZE):
+            batch = batchable[i:i + LABEL_BATCH_SIZE]
             try:
-                prompt = _build_prompt(top_files)
+                prompt = _build_batch_prompt(batch)
                 response = llm.complete(prompt)
-                title, summary = _parse_llm_response(response)
-                if title and summary:
-                    cluster["suggested_title"] = title
-                    cluster["functional_summary"] = summary
-                    # Also set name if not already set
-                    if not cluster.get("name"):
-                        cluster["name"] = title
-                    continue
+                labeled.update(_parse_batch_response(response))
             except Exception as e:
-                print(f"[WARN] LLM labeling failed for {cluster_label}: {e}")
+                ids = [cid for cid, _ in batch]
+                remaining = len(batchable) - i - len(batch)
+                print(f"[WARN] LLM batch labeling failed for {ids}: {e}")
+                # A failure here already paid the provider's own retry (e.g. Gemini's
+                # 429 retry, up to ~20s). If it still failed, quota/network is down for
+                # this run, not just this batch -- retrying every remaining batch would
+                # each pay that same cost again for no benefit. Stop and let the rest
+                # fall back to _auto_title immediately.
+                if remaining:
+                    print(f"[WARN] Skipping LLM labeling for {remaining} remaining cluster(s); using fallback names")
+                break
+            if i + LABEL_BATCH_SIZE < len(batchable):
+                time.sleep(2)  # stay well under the free-tier per-minute cap
+
+    for cluster in clusters:
+        cluster_id = cluster["id"]
+        node_ids = cluster.get("node_ids", [])
+        top_files = top_files_by_id[cluster_id]
+
+        if cluster_id in labeled:
+            title, summary = labeled[cluster_id]
+            cluster["suggested_title"] = title
+            cluster["functional_summary"] = summary
+            if not cluster.get("name"):
+                cluster["name"] = title
+            continue
 
         # Fallback
-        auto = _auto_title(cluster_label, top_files)
+        auto = _auto_title(cluster_id, top_files)
         cluster["suggested_title"] = auto
         cluster["functional_summary"] = (
             f"Contains {len(node_ids)} file(s) related to "

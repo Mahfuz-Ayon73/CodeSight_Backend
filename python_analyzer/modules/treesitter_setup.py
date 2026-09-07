@@ -135,6 +135,13 @@ REF_USAGE_CAPTURE_NAMES = {
     "ref_arg", "ref_member_arg", "ref_array_elem", "ref_obj_value", "ref_shorthand",
 }
 
+# Contract-link extraction captures whole call nodes; callee and argument
+# shapes are walked in Python because a flat capture list can't reliably
+# pair a callee with its own arguments.
+_CALL_NODE_QUERY_TEXT = """
+    (call_expression) @call
+"""
+
 # ---------------------------------------------------------------------------
 # Query caches & accessors
 # ---------------------------------------------------------------------------
@@ -143,6 +150,7 @@ _QUERY_CACHE:        dict = {}
 _EXPORT_QUERY_CACHE: dict = {}
 _CALLSITE_QUERY_CACHE: dict = {}
 _REF_USAGE_QUERY_CACHE: dict = {}
+_CALL_NODE_QUERY_CACHE: dict = {}
 
 
 def get_import_query(lang):
@@ -177,3 +185,12 @@ def get_ref_usage_query(lang):
         except Exception:
             _REF_USAGE_QUERY_CACHE[lang] = None
     return _REF_USAGE_QUERY_CACHE[lang]
+
+
+def get_call_node_query(lang):
+    if lang not in _CALL_NODE_QUERY_CACHE:
+        try:
+            _CALL_NODE_QUERY_CACHE[lang] = lang.query(_CALL_NODE_QUERY_TEXT)
+        except Exception:
+            _CALL_NODE_QUERY_CACHE[lang] = None
+    return _CALL_NODE_QUERY_CACHE[lang]

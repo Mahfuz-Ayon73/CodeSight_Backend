@@ -114,6 +114,12 @@ def build_graph(nodes: list[dict], edges: list[dict]) -> nx.DiGraph:
                 G[src][tgt]["is_dead_import"] = (
                     G[src][tgt].get("is_dead_import", True) and edge["is_dead_import"]
                 )
+            # A merged edge is synthetic only if EVERY contributing edge was —
+            # one real import is enough to make the link genuine.
+            G[src][tgt]["is_synthetic"] = (
+                G[src][tgt].get("is_synthetic", False)
+                and bool(edge.get("is_synthetic", False))
+            )
             if edge.get("source_line") is not None and G[src][tgt].get("source_line") is None:
                 G[src][tgt]["source_line"] = edge["source_line"]
             if edge.get("target_line") is not None and G[src][tgt].get("target_line") is None:
@@ -127,6 +133,7 @@ def build_graph(nodes: list[dict], edges: list[dict]) -> nx.DiGraph:
                 binding=edge.get("binding", ""),
                 called_names=edge.get("called_names", []),
                 is_dead_import=edge.get("is_dead_import", False),
+                is_synthetic=edge.get("is_synthetic", False),
                 source_line=edge.get("source_line"),
                 target_line=edge.get("target_line"),
             )
@@ -163,6 +170,31 @@ def inject_test_edges(G: nx.DiGraph) -> nx.DiGraph:
 
 
 # ---------------------------------------------------------------------------
+# Degree helpers
+# ---------------------------------------------------------------------------
+
+# Contract edges ("CALLS_API", "EMITS_EVENT") describe runtime string links,
+# not code dependency. They must not affect god-file detection, orchestrator
+# pruning, or execution-role assignment — otherwise merely *recording* that a
+# page calls an API would reclassify the route handler as a shared dependency
+# and move files between clusters. RENDERS is deliberately NOT excluded here:
+# it has always counted toward degree, and changing that would alter existing
+# clustering output.
+_CONTRACT_EDGE_TYPES = frozenset({"CALLS_API", "EMITS_EVENT", "PROVIDES_STATE"})
+
+
+def _degrees_excluding_contracts(G: nx.DiGraph) -> tuple[dict, dict]:
+    in_deg  = {nid: 0 for nid in G.nodes()}
+    out_deg = {nid: 0 for nid in G.nodes()}
+    for src, tgt, data in G.edges(data=True):
+        if data.get("edge_type") in _CONTRACT_EDGE_TYPES:
+            continue
+        out_deg[src] += 1
+        in_deg[tgt]  += 1
+    return in_deg, out_deg
+
+
+# ---------------------------------------------------------------------------
 # Shared-dependency extraction
 # ---------------------------------------------------------------------------
 
@@ -172,8 +204,9 @@ def extract_shared_dependencies(G: nx.DiGraph) -> tuple[nx.DiGraph, list[int]]:
         return G, []
     shared_dep_ids: list[int] = []
     G_clean = G.copy()
+    in_deg, out_deg = _degrees_excluding_contracts(G)
     for nid in list(G.nodes()):
-        in_d, out_d = G.in_degree(nid), G.out_degree(nid)
+        in_d, out_d = in_deg[nid], out_deg[nid]
         if out_d == 0 and (in_d / n_total) > SHARED_DEP_IN_RATIO:
             shared_dep_ids.append(nid)
             G.nodes[nid]["execution_role"]   = "SHARED_DEPENDENCY"
@@ -196,8 +229,9 @@ def prune_orchestrators(G: nx.DiGraph) -> tuple[nx.DiGraph, list[int]]:
         return G, []
     pruned_ids: list[int] = []
     G_pruned = G.copy()
+    in_deg, out_deg = _degrees_excluding_contracts(G)
     for nid in list(G.nodes()):
-        in_d, out_d = G.in_degree(nid), G.out_degree(nid)
+        in_d, out_d = in_deg[nid], out_deg[nid]
         if in_d == 0 and (out_d / n_total) > ORCHESTRATOR_OUT_RATIO:
             G_pruned.remove_edges_from(list(G_pruned.out_edges(nid)))
             pruned_ids.append(nid)
@@ -211,8 +245,9 @@ def prune_orchestrators(G: nx.DiGraph) -> tuple[nx.DiGraph, list[int]]:
 # ---------------------------------------------------------------------------
 
 def _assign_global_roles(G: nx.DiGraph) -> None:
+    in_deg, out_deg = _degrees_excluding_contracts(G)
     for nid in G.nodes():
-        in_d, out_d = G.in_degree(nid), G.out_degree(nid)
+        in_d, out_d = in_deg[nid], out_deg[nid]
         if in_d == 0 and out_d > 0:
             G.nodes[nid]["execution_role"] = "ENTRY_POINT"
         elif out_d == 0 and in_d > 0:
@@ -225,16 +260,22 @@ def _assign_global_roles(G: nx.DiGraph) -> None:
 # Community detection
 # ---------------------------------------------------------------------------
 
+_NON_STRUCTURAL_EDGE_TYPES = frozenset({
+    "RENDERS", "SEMANTIC_SIMILARITY", "CALLS_API", "EMITS_EVENT", "PROVIDES_STATE",
+})
+
+
 def _is_structural_edge(data: dict) -> bool:
     """
     Return True if this edge should participate in community detection.
 
-    Only "BELONGS_TO_DOMAIN" edges (weight > 0) count. "RENDERS" and
-    "SEMANTIC_SIMILARITY" edges are preserved on the graph but stripped here
-    so shared UI imports / explanatory placement edges don't influence
+    Only "BELONGS_TO_DOMAIN" edges (weight > 0) count. "RENDERS",
+    "SEMANTIC_SIMILARITY", and the contract types ("CALLS_API", "EMITS_EVENT")
+    are preserved on the graph but stripped here so shared UI imports,
+    explanatory placement edges, and runtime string links don't influence
     community detection.
     """
-    if data.get("edge_type") in ("RENDERS", "SEMANTIC_SIMILARITY"):
+    if data.get("edge_type") in _NON_STRUCTURAL_EDGE_TYPES:
         return False
     return float(data.get("weight", 1.0)) > 0.0
 
@@ -797,10 +838,11 @@ def cluster_codebase(
         if c.get("_is_intermediate"):
             continue
         sg = G.subgraph(c["node_ids"])
+        sg_in, sg_out = _degrees_excluding_contracts(sg)
         for nid in c["node_ids"]:
             if G.nodes.get(nid, {}).get("execution_role") == "SHARED_DEPENDENCY":
                 continue
-            in_d, out_d = sg.in_degree(nid), sg.out_degree(nid)
+            in_d, out_d = sg_in.get(nid, 0), sg_out.get(nid, 0)
             if in_d == 0 and out_d > 0:
                 G.nodes[nid]["execution_role"] = "ENTRY_POINT"
             elif out_d == 0 and in_d > 0:

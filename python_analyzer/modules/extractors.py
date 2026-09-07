@@ -13,6 +13,7 @@ from modules.treesitter_setup import (
     get_export_query,
     get_callsite_query,
     get_ref_usage_query,
+    get_call_node_query,
     EXPORT_QUERY_CAPTURE_NAMES,
     CALLSITE_QUERY_CAPTURE_NAMES,
     REF_USAGE_CAPTURE_NAMES,
@@ -185,3 +186,97 @@ def extract_ref_usages(source_code: str, canonical: str) -> set[str]:
         return refs
     except Exception:
         return set()
+
+
+# ---------------------------------------------------------------------------
+# Call-with-arguments extraction (contract links)
+# ---------------------------------------------------------------------------
+
+def _callee_name(fn_node) -> str:
+    """`fetch` -> "fetch"; `axios.post` -> "axios.post"; anything else -> ""."""
+    if fn_node is None:
+        return ""
+    if fn_node.type == "identifier":
+        return fn_node.text.decode("utf-8")
+    if fn_node.type == "member_expression":
+        obj  = fn_node.child_by_field_name("object")
+        prop = fn_node.child_by_field_name("property")
+        if obj is not None and prop is not None and obj.type == "identifier":
+            return f"{obj.text.decode('utf-8')}.{prop.text.decode('utf-8')}"
+    return ""
+
+
+def _static_template_prefix(node) -> Optional[str]:
+    """
+    Static leading text of a template string. `` `${BASE}/auth/login` `` yields
+    "/auth/login" — enough to match a route suffix when the host is a variable.
+    """
+    parts: list[str] = []
+    for child in node.children:
+        if child.type == "string_fragment":
+            parts.append(child.text.decode("utf-8"))
+        elif child.type == "template_substitution":
+            parts.append("*")
+    joined = "".join(parts).strip()
+    return joined or None
+
+
+def _arg_descriptor(node) -> Optional[dict]:
+    if node.type == "string":
+        for child in node.children:
+            if child.type == "string_fragment":
+                return {"kind": "string", "value": child.text.decode("utf-8")}
+        return {"kind": "string", "value": ""}
+    if node.type == "template_string":
+        value = _static_template_prefix(node)
+        return {"kind": "string", "value": value} if value else None
+    if node.type == "identifier":
+        return {"kind": "identifier", "value": node.text.decode("utf-8")}
+    if node.type == "member_expression":
+        return {"kind": "identifier", "value": node.text.decode("utf-8")}
+    return {"kind": "other", "value": ""}
+
+
+def extract_call_arguments(source_code: str, canonical: str) -> list[dict]:
+    """
+    Every call expression as {"callee", "line", "args": [{"kind", "value"}]}.
+
+    Backs contract-link detection: `fetch("/api/auth/login")`,
+    `router.post("/login", handler)`, `app.use("/api/auth", authRoutes)`,
+    `emitter.on("user.created", cb)` are all the same shape — a callee plus
+    a string literal that some other file agrees on.
+    """
+    if not _TS_AVAILABLE:
+        return []
+    from tree_sitter import Parser as TSParser
+    lang  = get_language_for_file(canonical)
+    query = get_call_node_query(lang)
+    if query is None:
+        return []
+    try:
+        parser_obj = TSParser(lang)
+        tree       = parser_obj.parse(bytes(source_code, "utf-8"))
+        captures   = query.captures(tree.root_node)
+        calls: list[dict] = []
+        for _, node in _iter_captures(captures, {"call"}):
+            callee = _callee_name(node.child_by_field_name("function"))
+            if not callee:
+                continue
+            args_node = node.child_by_field_name("arguments")
+            if args_node is None:
+                continue
+            args: list[dict] = []
+            for child in args_node.named_children:
+                desc = _arg_descriptor(child)
+                if desc is not None:
+                    args.append(desc)
+            if not any(a["kind"] == "string" and a["value"] for a in args):
+                continue
+            calls.append({
+                "callee": callee,
+                "line":   node.start_point[0] + 1,
+                "args":   args,
+            })
+        return calls
+    except Exception:
+        return []

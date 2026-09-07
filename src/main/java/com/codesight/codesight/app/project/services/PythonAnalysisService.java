@@ -3,9 +3,12 @@ package com.codesight.codesight.app.project.services;
 import com.codesight.codesight.app.project.dto.AnalysisRequestDto;
 import com.codesight.codesight.app.project.dto.AnalysisResponseDto;
 import com.codesight.codesight.app.project.dto.AnalysisStatusResponseDto;
+import com.codesight.codesight.app.project.dto.ValidateDomainsRequestDto;
+import com.codesight.codesight.app.project.dto.ValidateDomainsResponseDto;
 import com.codesight.codesight.app.project.model.AnalysisStatus;
 import com.codesight.codesight.app.project.model.ProjectModel;
 import com.codesight.codesight.app.project.repository.ProjectRepository;
+import com.codesight.codesight.app.project.services.graph.SnapshotPersistenceService;
 import com.codesight.codesight.common.exception.ResourceNotFoundException;
 import lombok.RequiredArgsConstructor;
 import lombok.extern.slf4j.Slf4j;
@@ -16,6 +19,7 @@ import org.springframework.stereotype.Service;
 import org.springframework.web.client.RestTemplate;
 import org.springframework.web.client.ResourceAccessException;
 
+import java.nio.file.Files;
 import java.nio.file.Path;
 import java.nio.file.Paths;
 import java.time.LocalDateTime;
@@ -30,6 +34,7 @@ public class PythonAnalysisService {
     private final ProjectRepository projectRepository;
     private final RestTemplate restTemplate;
     private final AnalysisProgressStore analysisProgressStore;
+    private final SnapshotPersistenceService snapshotPersistenceService;
 
     @Value("${codesight.python-analyzer.base-url:http://localhost:8000}")
     private String pythonAnalyzerBaseUrl;
@@ -150,6 +155,44 @@ public class PythonAnalysisService {
     }
 
     /**
+     * On-demand LLM domain validation for an already-completed analysis. Deliberately
+     * not part of {@link #triggerAnalysisAsync} / {@link #triggerAnalysisSync} -- domain
+     * validation used to run inline as part of every analysis and could add minutes to
+     * it; it's now triggered explicitly by the user (a button on the finished result)
+     * instead of sitting on the critical path of every run.
+     */
+    public ValidateDomainsResponseDto validateDomains(UUID organizationId, UUID projectId) {
+        Path outputDir = Paths.get(analysisOutputDir)
+                .resolve(organizationId.toString())
+                .resolve(projectId.toString());
+
+        ValidateDomainsRequestDto request = new ValidateDomainsRequestDto();
+        request.setOutputDir(outputDir.toString());
+
+        HttpHeaders headers = new HttpHeaders();
+        headers.setContentType(MediaType.APPLICATION_JSON);
+        HttpEntity<ValidateDomainsRequestDto> httpEntity = new HttpEntity<>(request, headers);
+
+        try {
+            ResponseEntity<ValidateDomainsResponseDto> response = restTemplate.postForEntity(
+                pythonAnalyzerBaseUrl + "/analyze/validate-domains",
+                httpEntity,
+                ValidateDomainsResponseDto.class
+            );
+            if (response.getBody() != null) {
+                return response.getBody();
+            }
+            throw new RuntimeException("Empty response from Python analyzer");
+        } catch (Exception e) {
+            log.error("Domain validation failed for project {}", projectId, e);
+            ValidateDomainsResponseDto errorResponse = new ValidateDomainsResponseDto();
+            errorResponse.setSuccess(false);
+            errorResponse.setErrorMessage("Domain validation service error: " + e.getMessage());
+            return errorResponse;
+        }
+    }
+
+    /**
      * Poll Python's real task status until the analysis completes, fails, or times out,
      * mirroring live stage/message into AnalysisProgressStore and only writing the terminal
      * status to the DB once Python actually reports it.
@@ -185,6 +228,7 @@ public class PythonAnalysisService {
                 projectRepository.save(project);
                 analysisProgressStore.remove(progressKey);
                 log.info("Analysis completed successfully for project {}: {}", projectId, status.getBlueprintPath());
+                persistLiveSnapshot(organizationId, projectId);
                 return;
             }
 
@@ -203,6 +247,30 @@ public class PythonAnalysisService {
         updateProjectAnalysisStatus(organizationId, projectId, AnalysisStatus.FAILED, "Analysis timed out");
         analysisProgressStore.remove(progressKey);
         log.error("Analysis timed out for project {}", projectId);
+    }
+
+    /**
+     * Persists a {@code GraphSnapshot} row for the just-completed live analysis, mirroring
+     * what {@code HistoricalAnalysisService} does for historical commits. This gives the
+     * live/default blueprint a snapshotId that cluster overrides and future diffing can key
+     * off — without it, only Phase-2 historical re-analyses had a snapshot to reference.
+     * Best-effort: a failure here must not turn an otherwise-successful analysis into a
+     * failed one, so it's logged and swallowed rather than propagated.
+     */
+    private void persistLiveSnapshot(UUID organizationId, UUID projectId) {
+        try {
+            Path blueprintPath = Paths.get(analysisOutputDir)
+                    .resolve(organizationId.toString())
+                    .resolve(projectId.toString())
+                    .resolve("graph_blueprint.json");
+            if (!Files.exists(blueprintPath)) {
+                log.warn("[ANALYSIS] No blueprint file at {} — skipping snapshot persistence", blueprintPath);
+                return;
+            }
+            snapshotPersistenceService.persistSnapshot(projectId, blueprintPath);
+        } catch (Exception e) {
+            log.warn("[ANALYSIS] Failed to persist graph snapshot for project {}: {}", projectId, e.getMessage());
+        }
     }
 
     private AnalysisStatusResponseDto fetchAnalysisStatus(UUID projectId) {

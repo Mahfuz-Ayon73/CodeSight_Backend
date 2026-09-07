@@ -24,8 +24,9 @@ from typing import Callable, Optional
 from modules.ingestion import crawl, save_registry, partition_registry
 from modules.parser import parse_codebase, detect_module_system
 from modules.clustering import cluster_codebase
-from modules.domain_detection import detect_domains
+from modules.domain_detection import detect_domains, validate_domains
 from modules.summarizer import label_clusters, get_llm_provider
+from modules.journeys import detect_entry_points, summarize_coverage
 from cluster_analytics import generate as generate_analytics
 
 
@@ -124,12 +125,27 @@ def build_blueprint(
             "domain_type":       cluster.get("domain_type", "UNCLASSIFIED"),
             "domain_confidence": cluster.get("domain_confidence", 0.0),
             "domain_evidence":   cluster.get("domain_evidence", []),
+            "domain_llm_validated":  cluster.get("domain_llm_validated"),
+            "domain_llm_confidence": cluster.get("domain_llm_confidence"),
+            "domain_llm_reason":     cluster.get("domain_llm_reason"),
         })
 
     detected_domains = sorted({
         c.get("domain") for c in clusters
         if c.get("domain") and c.get("domain_type") in ("CANONICAL", "EMERGENT")
     })
+
+    # Journey roots — computed here because flat_nodes already carry their
+    # final cluster_id and domain, and flat_edges are in canonical-path form.
+    entry_points = detect_entry_points(flat_nodes, flat_edges)
+    journey_coverage = summarize_coverage(flat_nodes, flat_edges, entry_points)
+    if entry_points:
+        landing = [e for e in entry_points if e.get("is_landing")]
+        print(f"[Journeys] {len(entry_points)} entry point(s), "
+              f"{len(landing)} landing; {journey_coverage['reached']}/"
+              f"{journey_coverage['total']} files reachable.")
+    else:
+        print("[Journeys] No route entry points detected for this paradigm.")
 
     return {
         "schema_version": "2.2",
@@ -141,7 +157,9 @@ def build_blueprint(
             "total_clusters":      len(flat_clusters),
             "max_cluster_size":    max((len(c.get("node_ids", [])) for c in clusters), default=0),
             "detected_domains":    detected_domains,
+            "journey_coverage":    journey_coverage,
         },
+        "entry_points": entry_points,
         "clusters": flat_clusters,
         "nodes":    flat_nodes,
         "edges":    flat_edges,
@@ -278,9 +296,16 @@ def run_analysis(
     _report("domain_detection", "Detecting functional domains...")
     clusters = detect_domains(clusters, nodes, app_edges)
 
+    llm = get_llm_provider()
+
+    # LLM domain validation is intentionally NOT run here. It used to be an inline
+    # phase, but that made every analysis pay for however many CANONICAL/EMERGENT
+    # clusters exist before results could be shown at all. It's now a separate,
+    # on-demand pass (see validate_domains_for_blueprint below) triggered by the
+    # user from the finished result instead of blocking it.
+
     # Phase 4: Label
     _report("labeling", "Labeling clusters with AI summaries...")
-    llm = get_llm_provider()
     clusters = label_clusters(clusters, nodes, llm)
 
     # Build and write blueprint
@@ -315,6 +340,72 @@ def run_analysis(
     _report("done", "Analysis complete")
 
     return str(blueprint_path)
+
+
+# ---------------------------------------------------------------------------
+# On-demand LLM domain validation — deliberately NOT part of run_analysis.
+# Triggered by the user after the analysis result is already showing, rather
+# than adding an LLM-dependent phase to the critical path of every analysis.
+# ---------------------------------------------------------------------------
+
+def validate_domains_for_blueprint(blueprint_path: str) -> dict:
+    """
+    Loads an already-written graph_blueprint.json, runs the LLM domain
+    validation/suggestion pass over its CANONICAL/EMERGENT clusters, merges
+    the domain_llm_* fields back into the file, and rewrites it in place.
+
+    The flat blueprint schema stores cluster membership as nodes[].cluster_id
+    (a foreign key), but validate_domains() expects the pre-flatten shape
+    (clusters[].node_ids) that build_blueprint had internally -- so this
+    reconstructs node_ids per cluster before calling it, and strips it back
+    out before writing, to keep the on-disk schema unchanged.
+
+    Returns summary counts for the API response; raises if no blueprint
+    exists at that path or the file is unreadable.
+    """
+    path = Path(blueprint_path)
+    with open(path, "r", encoding="utf-8") as f:
+        blueprint = json.load(f)
+
+    nodes = blueprint.get("nodes", [])
+    clusters = blueprint.get("clusters", [])
+
+    members_by_cluster: dict[str, list[str]] = {}
+    for n in nodes:
+        members_by_cluster.setdefault(n["cluster_id"], []).append(n["id"])
+    for c in clusters:
+        c["node_ids"] = members_by_cluster.get(c["id"], [])
+
+    llm = get_llm_provider()
+    if llm is None:
+        return {
+            "llm_configured": False,
+            "clusters_checked": 0,
+            "clusters_confirmed": 0,
+            "clusters_with_suggestions": 0,
+        }
+
+    clusters = validate_domains(clusters, nodes, llm)
+
+    checked = confirmed = suggested = 0
+    for c in clusters:
+        c.pop("node_ids", None)  # internal-only; not part of the flat schema on disk
+        if "domain_llm_validated" in c:
+            checked += 1
+            confirmed += bool(c["domain_llm_validated"])
+        if c.get("domain_llm_suggested_name"):
+            suggested += 1
+
+    blueprint["clusters"] = clusters
+    with open(path, "w", encoding="utf-8") as f:
+        json.dump(blueprint, f, indent=2)
+
+    return {
+        "llm_configured": True,
+        "clusters_checked": checked,
+        "clusters_confirmed": confirmed,
+        "clusters_with_suggestions": suggested,
+    }
 
 
 if __name__ == "__main__":

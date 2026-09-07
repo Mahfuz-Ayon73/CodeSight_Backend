@@ -1,6 +1,7 @@
 package com.codesight.codesight.app.user.controllers;
 
 import com.codesight.codesight.app.user.dto.ChangePasswordRequestDto;
+import com.codesight.codesight.app.user.dto.SetLastOrganizationRequestDto;
 import com.codesight.codesight.app.user.dto.UserResponseDto;
 import com.codesight.codesight.app.user.model.UserModel;
 import com.codesight.codesight.app.user.services.UserService;
@@ -35,5 +36,12 @@ public class UserController {
                                              @Valid @RequestBody ChangePasswordRequestDto request) {
         userService.changePassword(currentUser.getId(), request.getCurrentPassword(), request.getNewPassword());
         return ResponseEntity.ok(Map.of("message", "Password changed successfully."));
+    }
+
+    @PutMapping("/last-organization")
+    public ResponseEntity<?> setLastOrganization(@AuthenticationPrincipal UserModel currentUser,
+                                                  @Valid @RequestBody SetLastOrganizationRequestDto request) {
+        userService.setLastOrganization(currentUser.getId(), request.getOrganizationId());
+        return ResponseEntity.ok(Map.of("message", "Last organization updated."));
     }
 }

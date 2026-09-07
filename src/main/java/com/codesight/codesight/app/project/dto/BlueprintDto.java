@@ -23,6 +23,10 @@ public class BlueprintDto {
     private List<EdgeDto> edges;
     private List<ClusterDto> clusters;
 
+    /** Journey roots — where a reader should start. Null for pre-journey analyses. */
+    @JsonProperty("entry_points")
+    private List<EntryPointDto> entryPoints;
+
     @Data
     @JsonIgnoreProperties(ignoreUnknown = true)
     public static class ProjectMetadata {
@@ -40,6 +44,61 @@ public class BlueprintDto {
 
         @JsonProperty("max_cluster_size")
         private Integer maxClusterSize;
+
+        @JsonProperty("detected_domains")
+        private List<String> detectedDomains;
+
+        @JsonProperty("journey_coverage")
+        private JourneyCoverage journeyCoverage;
+    }
+
+    @Data
+    @JsonIgnoreProperties(ignoreUnknown = true)
+    public static class JourneyCoverage {
+        private Integer reached;
+        private Integer total;
+
+        @JsonProperty("unreached_count")
+        private Integer unreachedCount;
+
+        @JsonProperty("unreached_sample")
+        private List<String> unreachedSample;
+    }
+
+    @Data
+    @JsonIgnoreProperties(ignoreUnknown = true)
+    public static class EntryPointDto {
+        private String file;
+        private String url;
+        /** "page" | "api" | "server" */
+        private String kind;
+
+        @JsonProperty("auth_state")
+        private String authState;
+
+        private Double confidence;
+        private List<String> evidence;
+
+        /** Layouts wrapping this screen, outermost first, ending with the file itself. */
+        @JsonProperty("render_chain")
+        private List<String> renderChain;
+
+        @JsonProperty("cluster_id")
+        private String clusterId;
+
+        private String domain;
+
+        @JsonProperty("reach_count")
+        private Integer reachCount;
+
+        @JsonProperty("own_reach_count")
+        private Integer ownReachCount;
+
+        @JsonProperty("reach_ratio")
+        private Double reachRatio;
+
+        @JsonProperty("is_landing")
+        private Boolean isLanding;
     }
 
     @Data
@@ -94,6 +153,14 @@ public class BlueprintDto {
         @JsonProperty("is_dead_import")
         private Boolean isDeadImport;
 
+        /**
+         * True for convention/similarity edges the analyzer inferred rather than
+         * read from an import. The tour excludes them, so dropping this field
+         * here would make it walk hops that do not exist in the source.
+         */
+        @JsonProperty("is_synthetic")
+        private Boolean isSynthetic;
+
         private String type;
 
         @JsonProperty("source_line")
@@ -130,5 +197,22 @@ public class BlueprintDto {
 
         @JsonProperty("domain_evidence")
         private List<String> domainEvidence;
+
+        /** Optional LLM sanity pass (see /validate-domains) -- advisory only, never overrides `domain`. */
+        @JsonProperty("domain_llm_validated")
+        private Boolean domainLlmValidated;
+
+        @JsonProperty("domain_llm_confidence")
+        private Double domainLlmConfidence;
+
+        @JsonProperty("domain_llm_reason")
+        private String domainLlmReason;
+
+        /** Only set for clusters the LLM flagged as weak -- a content-grounded replacement name. */
+        @JsonProperty("domain_llm_suggested_name")
+        private String domainLlmSuggestedName;
+
+        @JsonProperty("domain_llm_suggested_reason")
+        private String domainLlmSuggestedReason;
     }
 }

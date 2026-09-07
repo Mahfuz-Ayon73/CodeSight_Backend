@@ -22,4 +22,6 @@ public class UserResponseDto {
     private boolean isEnabled;
     private LocalDateTime createdAt;
     private LocalDateTime updatedAt;
+    /** Organization the user last switched to — used to resume in the same "tenant" on next login. */
+    private UUID lastOrganizationId;
 }

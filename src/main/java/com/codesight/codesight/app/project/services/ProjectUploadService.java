@@ -18,7 +18,6 @@ import org.springframework.web.multipart.MultipartFile;
 import java.io.IOException;
 import java.nio.file.Path;
 import java.time.LocalDateTime;
-import java.util.List;
 import java.util.UUID;
 
 @Slf4j
@@ -30,7 +29,6 @@ public class ProjectUploadService {
     private final OrganizationAccessService organizationAccessService;
     private final CodebaseStorageService codebaseStorageService;
     private final ZipExtractService zipExtractService;
-    private final FolderUploadService folderUploadService;
     private final GithubCloneService githubCloneService;
     private final PythonAnalysisService pythonAnalysisService;
     private final CloneProgressStore cloneProgressStore;
@@ -74,33 +72,6 @@ public class ProjectUploadService {
         }
 
         log.info("[ZIP] Upload finished successfully");
-        return ObjectToDTOMapper.toProjectResponseDto(projectRepository.save(project));
-    }
-
-    @Transactional
-    public ProjectResponseDto uploadFolder(
-            UUID organizationId,
-            UUID projectId,
-            UUID userId,
-            List<MultipartFile> files
-    ) throws IOException {
-        ProjectModel project = loadProjectForUpload(organizationId, projectId, userId);
-        Path repoPath = codebaseStorageService.resolveProjectRepoPath(organizationId, projectId);
-
-        try {
-            codebaseStorageService.prepareRepoDirectory(repoPath);
-            folderUploadService.saveFolderFiles(files, repoPath);
-            markUploadSuccess(project, ProjectSourceType.LOCAL_FOLDER, null, repoPath);
-        } catch (IOException ex) {
-            markUploadFailure(project, ex.getMessage());
-            projectRepository.save(project);
-            throw ex;
-        } catch (RuntimeException ex) {
-            markUploadFailure(project, ex.getMessage());
-            projectRepository.save(project);
-            throw ex;
-        }
-
         return ObjectToDTOMapper.toProjectResponseDto(projectRepository.save(project));
     }
 

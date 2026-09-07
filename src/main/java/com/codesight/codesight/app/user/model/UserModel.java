@@ -47,6 +47,9 @@ public class UserModel implements UserDetails {
     @Builder.Default
     private boolean isEnabled = false;
 
+    /** Organization the user last switched to — used to resume in the same "tenant" on next login. */
+    private UUID lastOrganizationId;
+
     private LocalDateTime createdAt;
     private LocalDateTime updatedAt;
 

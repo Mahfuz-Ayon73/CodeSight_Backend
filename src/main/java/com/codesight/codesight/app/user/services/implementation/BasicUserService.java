@@ -1,11 +1,13 @@
 package com.codesight.codesight.app.user.services.implementation;
 
+import com.codesight.codesight.app.organization.repository.OrganizationMemberRepository;
 import com.codesight.codesight.app.user.dto.UserResponseDto;
 import com.codesight.codesight.app.user.model.UserModel;
 import com.codesight.codesight.app.user.repository.UserRepository;
 import com.codesight.codesight.app.user.services.UserService;
 import com.codesight.codesight.common.exception.BadCredentialsException;
 import com.codesight.codesight.common.exception.ResourceNotFoundException;
+import com.codesight.codesight.common.exception.UnauthorizedException;
 import com.codesight.codesight.common.utils.ObjectToDTOMapper;
 import lombok.RequiredArgsConstructor;
 import org.springframework.security.crypto.password.PasswordEncoder;
@@ -18,6 +20,7 @@ import java.util.UUID;
 public class BasicUserService implements UserService {
 
     private final UserRepository userRepository;
+    private final OrganizationMemberRepository organizationMemberRepository;
     private final PasswordEncoder passwordEncoder;
 
     @Override
@@ -50,6 +53,16 @@ public class BasicUserService implements UserService {
             throw new BadCredentialsException("Current password is incorrect");
         }
         user.setPassword(passwordEncoder.encode(newPassword));
+        userRepository.save(user);
+    }
+
+    @Override
+    public void setLastOrganization(UUID id, UUID organizationId) {
+        if (!organizationMemberRepository.existsByOrganizationIdAndUserId(organizationId, id)) {
+            throw new UnauthorizedException("You are not a member of this organization");
+        }
+        UserModel user = findById(id);
+        user.setLastOrganizationId(organizationId);
         userRepository.save(user);
     }
 }

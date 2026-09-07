@@ -12,6 +12,9 @@ from collections import Counter, defaultdict
 from pathlib import Path
 
 
+_CONTRACT_EDGE_TYPES = frozenset({"CALLS_API", "EMITS_EVENT", "PROVIDES_STATE"})
+
+
 def _get_dir(canonical_path: str) -> str:
     return str(Path(canonical_path).parent)
 
@@ -35,14 +38,21 @@ def generate(blueprint_path: str) -> str:
     meta          = blueprint.get("project_metadata", {})
     nodes_list    = blueprint.get("nodes", [])
     clusters_list = blueprint.get("clusters", [])
-    edges         = blueprint.get("edges", [])
+    all_edges     = blueprint.get("edges", [])
+
+    # Contract edges ("CALLS_API", "EMITS_EVENT") are runtime string links, not
+    # code dependency — clustering never saw them, so cohesion and density must
+    # not count them either. Otherwise one `fetch()` would make a semantic blob
+    # look topological and hide a genuine clustering problem.
+    edges = [e for e in all_edges if e.get("type") not in _CONTRACT_EDGE_TYPES]
 
     # Index nodes by their canonical_path (the string ID in v2 schema)
     nodes_by_id = {n["id"]: n for n in nodes_list}
 
     total_nodes = meta.get("total_nodes_indexed", len(nodes_by_id))
-    total_edges = meta.get("total_edges", len(edges))
+    total_edges = len(edges)
     edge_density = round(total_edges / max(total_nodes, 1), 4)
+    contract_edge_count = len(all_edges) - len(edges)
 
     # Build edge sets using string path IDs
     edge_set = {(e["source"], e["target"]) for e in edges}
@@ -236,6 +246,7 @@ def generate(blueprint_path: str) -> str:
         "summary": {
             "total_nodes":     total_nodes,
             "total_edges":     total_edges,
+            "contract_edges":  contract_edge_count,
             "edge_density":    edge_density,
             "total_clusters":  len(clusters_list),
             "algorithm_used":  algorithm_used,

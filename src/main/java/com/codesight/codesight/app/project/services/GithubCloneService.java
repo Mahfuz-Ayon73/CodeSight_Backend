@@ -33,7 +33,7 @@ public class GithubCloneService {
         }
 
         if (!trimmed.endsWith(".git")) {
-            trimmed = trimmed.endsWith("/") ? trimmed + ".git" : trimmed + ".git";
+            trimmed = trimmed.endsWith("/") ? trimmed.substring(0, trimmed.length() - 1) + ".git" : trimmed + ".git";
         }
 
         return trimmed;
@@ -48,9 +48,18 @@ public class GithubCloneService {
     }
 
     /**
+     * Clone depth — shallow enough to stay fast on large/old repos, deep enough
+     * to cover the commit timeline (last {@code count=10} requested by the
+     * frontend, see DashboardGraphPreview.tsx) with margin. The access token
+     * isn't persisted past this call, so this is the only place commit depth
+     * can be set — there's no credential left to do a later "unshallow" fetch.
+     */
+    private static final int CLONE_DEPTH = 30;
+
+    /**
      * Clone a repository, reporting live progress via the given monitor.
-     * Uses a depth-1 (shallow) clone — analysis only needs the current file
-     * tree, not full commit history, which is what made large/old repos slow.
+     * Shallow (depth-limited, not full history) — analysis only needs the
+     * current file tree, and a bounded depth keeps large/old repos fast.
      */
     public void cloneRepository(String githubUrl, Path destination, String accessToken, ProgressMonitor progressMonitor) {
         String normalizedUrl = normalizeGithubUrl(githubUrl);
@@ -59,7 +68,7 @@ public class GithubCloneService {
                     .setURI(normalizedUrl)
                     .setDirectory(destination.toFile())
                     .setCloneAllBranches(false)
-                    .setDepth(1);
+                    .setDepth(CLONE_DEPTH);
 
             if (progressMonitor != null) {
                 cloneCommand.setProgressMonitor(progressMonitor);
