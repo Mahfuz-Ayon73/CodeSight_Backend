@@ -32,6 +32,7 @@ cp .env.example .env
 
 **LLM Configuration (Optional):**
 - **Without LLM:** System works fine with auto-generated cluster names
+- **With Gemini:** Set `LLM_PROVIDER=gemini`, `GEMINI_API_KEY=your_key`, and optionally `GEMINI_MODEL=gemini-3.6-flash`
 - **With OpenAI:** Set `LLM_PROVIDER=openai` and `OPENAI_API_KEY=your_key`  
 - **With Ollama:** Set `LLM_PROVIDER=ollama` and `OLLAMA_BASE_URL=http://localhost:11434`
 
