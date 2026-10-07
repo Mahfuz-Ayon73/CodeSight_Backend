@@ -114,7 +114,8 @@ public class GraphHistoryController {
         organizationAccessService.requireMembership(organizationId, currentUser.getId());
         projectAccessService.requireMembership(projectId, currentUser.getId());
 
-        return graphSnapshotRepository.findFirstByProjectIdOrderByAnalyzedAtDesc(projectId)
+        return graphSnapshotRepository
+                .findFirstByProjectIdAndCommitShaIsNullOrderByAnalyzedAtDesc(projectId)
                 .map(GraphHistoryController::toSnapshotSummary)
                 .map(ResponseEntity::ok)
                 .orElseGet(() -> ResponseEntity.notFound().build());
