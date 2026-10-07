@@ -76,6 +76,9 @@ public class ProjectMemberService {
             UUID requesterId
     ) {
         organizationAccessService.requireMembership(organizationId, requesterId);
+        // Do not trust the two path IDs independently: the project must belong
+        // to the organization named in the request before exposing its members.
+        getProjectOrThrow(projectId, organizationId);
         projectAccessService.requireMembership(projectId, requesterId);
 
         return projectMemberRepository.findAllByProjectId(projectId).stream()
