@@ -1,11 +1,83 @@
 <!DOCTYPE html>
 <html xmlns:th="http://www.thymeleaf.org">
 <head>
-    <title>Account Verification</title>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <meta name="color-scheme" content="light dark">
+    <meta name="supported-color-schemes" content="light dark">
+    <title>Verify your CodeSight account</title>
+    <style>
+        @media (prefers-color-scheme: dark) {
+            body, .email-background { background-color: #06090f !important; }
+            .email-card { background-color: #111827 !important; border-color: #243244 !important; }
+            .email-heading, .email-brand, .email-link { color: #f8fafc !important; }
+            .email-copy { color: #cbd5e1 !important; }
+            .email-muted { color: #94a3b8 !important; }
+            .email-callout { background-color: #0b2230 !important; border-color: #164e63 !important; }
+        }
+    </style>
 </head>
-<body style="font-family: Arial, sans-serif; padding: 20px;">
-    <h2>Hello, <span th:text="${name}">User</span>!</h2>
-    <p>Thank you for registering at CodeSight. Please click the button below to verify your email address:</p>
-    <a th:href="${verificationUrl}" style="background-color: #4CAF50; color: white; padding: 10px 20px; text-decoration: none; border-radius: 5px; display: inline-block;">Verify Email</a>
+<body style="margin: 0; padding: 0; background-color: #f1f5f9; font-family: Arial, Helvetica, sans-serif; -webkit-font-smoothing: antialiased;">
+    <div style="display: none; max-height: 0; overflow: hidden; opacity: 0; color: transparent;">
+        Verify your email to finish setting up your CodeSight account.
+    </div>
+
+    <table class="email-background" role="presentation" width="100%" cellspacing="0" cellpadding="0" border="0" style="width: 100%; background-color: #f1f5f9;">
+        <tr>
+            <td align="center" style="padding: 40px 16px;">
+                <table role="presentation" width="100%" cellspacing="0" cellpadding="0" border="0" style="width: 100%; max-width: 600px;">
+                    <tr>
+                        <td style="padding: 0 4px 18px;">
+                            <span class="email-brand" style="font-size: 25px; line-height: 30px; font-weight: 700; letter-spacing: -0.7px; color: #0f172a;">Code<span style="color: #06b6d4;">Sight</span></span>
+                        </td>
+                    </tr>
+                    <tr>
+                        <td class="email-card" style="overflow: hidden; background-color: #ffffff; border: 1px solid #dbe4ee; border-radius: 12px; box-shadow: 0 18px 45px rgba(15, 23, 42, 0.09);">
+                            <div style="height: 5px; line-height: 5px; background-color: #06b6d4;">&nbsp;</div>
+                            <table role="presentation" width="100%" cellspacing="0" cellpadding="0" border="0">
+                                <tr>
+                                    <td style="padding: 38px 40px 34px;">
+                                        <table role="presentation" cellspacing="0" cellpadding="0" border="0" style="margin-bottom: 24px;">
+                                            <tr>
+                                                <td align="center" valign="middle" width="52" height="52" style="width: 52px; height: 52px; background-color: #ecfeff; border: 1px solid #a5f3fc; border-radius: 10px; color: #0891b2; font-size: 25px; font-weight: 700;">✓</td>
+                                            </tr>
+                                        </table>
+
+                                        <p style="margin: 0 0 10px; color: #0891b2; font-size: 12px; line-height: 18px; font-weight: 700; letter-spacing: 1.5px; text-transform: uppercase;">Confirm your email</p>
+                                        <h1 class="email-heading" style="margin: 0 0 16px; color: #0f172a; font-size: 28px; line-height: 35px; font-weight: 700; letter-spacing: -0.5px;">Welcome to CodeSight, <span th:text="${name}">there</span>.</h1>
+                                        <p class="email-copy" style="margin: 0 0 26px; color: #475569; font-size: 16px; line-height: 26px;">Verify your email address to activate your account and start turning your codebase into a clear, collaborative map.</p>
+
+                                        <table role="presentation" cellspacing="0" cellpadding="0" border="0">
+                                            <tr>
+                                                <td bgcolor="#06b6d4" style="border-radius: 8px;">
+                                                    <a th:href="${verificationUrl}" href="#" target="_blank" style="display: inline-block; padding: 13px 22px; color: #ffffff; font-size: 15px; line-height: 20px; font-weight: 700; text-decoration: none; border-radius: 8px;">Verify email address</a>
+                                                </td>
+                                            </tr>
+                                        </table>
+
+                                        <table class="email-callout" role="presentation" width="100%" cellspacing="0" cellpadding="0" border="0" style="margin-top: 28px; background-color: #ecfeff; border: 1px solid #cffafe; border-radius: 8px;">
+                                            <tr>
+                                                <td style="padding: 14px 16px;">
+                                                    <p class="email-copy" style="margin: 0; color: #334155; font-size: 13px; line-height: 20px;"><strong>This link expires in 15 minutes.</strong> If you did not create a CodeSight account, you can safely ignore this email.</p>
+                                                </td>
+                                            </tr>
+                                        </table>
+
+                                        <p class="email-muted" style="margin: 26px 0 8px; color: #64748b; font-size: 12px; line-height: 18px;">Button not working? Copy and paste this link into your browser:</p>
+                                        <a class="email-link" th:href="${verificationUrl}" th:text="${verificationUrl}" href="#" style="display: block; color: #0e7490; font-size: 12px; line-height: 18px; text-decoration: underline; word-break: break-all;">Verification link</a>
+                                    </td>
+                                </tr>
+                            </table>
+                        </td>
+                    </tr>
+                    <tr>
+                        <td align="center" style="padding: 20px 16px 0;">
+                            <p class="email-muted" style="margin: 0; color: #64748b; font-size: 12px; line-height: 19px;">CodeSight · Codebase intelligence for focused teams</p>
+                        </td>
+                    </tr>
+                </table>
+            </td>
+        </tr>
+    </table>
 </body>
 </html>
