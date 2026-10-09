@@ -23,6 +23,9 @@ public interface GraphSnapshotRepository extends JpaRepository<GraphSnapshot, UU
     /** Latest snapshot per project — used by "My Workspace" bootstrap. */
     Optional<GraphSnapshot> findFirstByProjectIdOrderByAnalyzedAtDesc(UUID projectId);
 
+    /** Latest live/HEAD analysis, excluding historical commit snapshots. */
+    Optional<GraphSnapshot> findFirstByProjectIdAndCommitShaIsNullOrderByAnalyzedAtDesc(UUID projectId);
+
     /** Whether a re-analysis is already in flight for this project. */
     boolean existsByProjectIdAndInProgressTrue(UUID projectId);
 

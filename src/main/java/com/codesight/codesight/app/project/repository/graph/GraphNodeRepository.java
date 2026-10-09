@@ -8,6 +8,7 @@ import org.springframework.data.repository.query.Param;
 import org.springframework.stereotype.Repository;
 
 import java.util.List;
+import java.util.Optional;
 import java.util.UUID;
 
 @Repository
@@ -15,8 +16,12 @@ public interface GraphNodeRepository extends JpaRepository<GraphNode, Long> {
 
     List<GraphNode> findBySnapshotId(UUID snapshotId);
 
+    Optional<GraphNode> findBySnapshotIdAndFilePath(UUID snapshotId, String filePath);
+
     /** Cluster membership used by the ReactFlow canvas. */
     List<GraphNode> findBySnapshotIdAndClusterId(UUID snapshotId, String clusterId);
+
+    boolean existsBySnapshotIdAndClusterId(UUID snapshotId, String clusterId);
 
     /** Bulk delete when a snapshot is demoted to blob-only. */
     @Modifying
